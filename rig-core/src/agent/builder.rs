@@ -2,7 +2,7 @@ use std::collections::HashMap;
 
 use crate::{
     completion::{CompletionModel, Document},
-    tool::{Tool, ToolSet},
+    tool::{Tool, ToolDyn, ToolSet},
     vector_store::VectorStoreIndexDyn,
 };
 
@@ -99,6 +99,13 @@ impl<M: CompletionModel> AgentBuilder<M> {
 
     /// Add a static tool to the agent
     pub fn tool(mut self, tool: impl Tool + 'static) -> Self {
+        let toolname = tool.name();
+        self.tools.add_tool(tool);
+        self.static_tools.push(toolname);
+        self
+    }
+    /// Add a dyn tool to the agent
+    pub fn dyn_tool(mut self, tool: impl ToolDyn + 'static) -> Self {
         let toolname = tool.name();
         self.tools.add_tool(tool);
         self.static_tools.push(toolname);
