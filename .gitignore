@@ -1,6 +1,10 @@
-.env
 target/
 .DS_Store
 .idea/
 .vscode/
 .devcontainer/
+.fastembed_cache/
+
+# env
+.env
+.envrc

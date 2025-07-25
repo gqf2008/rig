@@ -10,20 +10,22 @@
 //! ```
 
 use crate::{
+    OneOrMany,
     agent::AgentBuilder,
-    completion::{self, message, CompletionError, MessageError},
+    completion::{self, CompletionError, MessageError, message},
     extractor::ExtractorBuilder,
-    json_utils, OneOrMany,
+    impl_conversion_traits, json_utils,
 };
 
+use crate::client::{CompletionClient, ProviderClient};
 use crate::completion::CompletionRequest;
 use crate::json_utils::merge;
 use crate::providers::openai;
 use crate::providers::openai::send_compatible_streaming_request;
-use crate::streaming::{StreamingCompletionModel, StreamingCompletionResponse};
+use crate::streaming::StreamingCompletionResponse;
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 
 // ================================================================
 // Main Cohere Client
@@ -33,7 +35,18 @@ const PERPLEXITY_API_BASE_URL: &str = "https://api.perplexity.ai";
 #[derive(Clone)]
 pub struct Client {
     base_url: String,
+    api_key: String,
     http_client: reqwest::Client,
+}
+
+impl std::fmt::Debug for Client {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Client")
+            .field("base_url", &self.base_url)
+            .field("http_client", &self.http_client)
+            .field("api_key", &"<REDACTED>")
+            .finish()
+    }
 }
 
 impl Client {
@@ -41,39 +54,27 @@ impl Client {
         Self::from_url(api_key, PERPLEXITY_API_BASE_URL)
     }
 
-    /// Create a new Perplexity client from the `PERPLEXITY_API_KEY` environment variable.
-    /// Panics if the environment variable is not set.
-    pub fn from_env() -> Self {
-        let api_key = std::env::var("PERPLEXITY_API_KEY").expect("PERPLEXITY_API_KEY not set");
-        Self::new(&api_key)
-    }
-
     pub fn from_url(api_key: &str, base_url: &str) -> Self {
         Self {
             base_url: base_url.to_string(),
+            api_key: api_key.to_string(),
             http_client: reqwest::Client::builder()
-                .default_headers({
-                    let mut headers = reqwest::header::HeaderMap::new();
-                    headers.insert(
-                        "Authorization",
-                        format!("Bearer {}", api_key)
-                            .parse()
-                            .expect("Bearer token should parse"),
-                    );
-                    headers
-                })
                 .build()
                 .expect("Perplexity reqwest client should build"),
         }
     }
 
-    pub fn post(&self, path: &str) -> reqwest::RequestBuilder {
-        let url = format!("{}/{}", self.base_url, path).replace("//", "/");
-        self.http_client.post(url)
+    /// Use your own `reqwest::Client`.
+    /// The required headers will be automatically attached upon trying to make a request.
+    pub fn with_custom_client(mut self, client: reqwest::Client) -> Self {
+        self.http_client = client;
+
+        self
     }
 
-    pub fn completion_model(&self, model: &str) -> CompletionModel {
-        CompletionModel::new(self.clone(), model)
+    pub fn post(&self, path: &str) -> reqwest::RequestBuilder {
+        let url = format!("{}/{}", self.base_url, path).replace("//", "/");
+        self.http_client.post(url).bearer_auth(&self.api_key)
     }
 
     pub fn agent(&self, model: &str) -> AgentBuilder<CompletionModel> {
@@ -87,6 +88,37 @@ impl Client {
         ExtractorBuilder::new(self.completion_model(model))
     }
 }
+
+impl ProviderClient for Client {
+    /// Create a new Perplexity client from the `PERPLEXITY_API_KEY` environment variable.
+    /// Panics if the environment variable is not set.
+    fn from_env() -> Self {
+        let api_key = std::env::var("PERPLEXITY_API_KEY").expect("PERPLEXITY_API_KEY not set");
+        Self::new(&api_key)
+    }
+
+    fn from_val(input: crate::client::ProviderValue) -> Self {
+        let crate::client::ProviderValue::Simple(api_key) = input else {
+            panic!("Incorrect provider value type")
+        };
+        Self::new(&api_key)
+    }
+}
+
+impl CompletionClient for Client {
+    type CompletionModel = CompletionModel;
+
+    fn completion_model(&self, model: &str) -> CompletionModel {
+        CompletionModel::new(self.clone(), model)
+    }
+}
+
+impl_conversion_traits!(
+    AsTranscription,
+    AsEmbeddings,
+    AsImageGeneration,
+    AsAudioGeneration for Client
+);
 
 #[derive(Debug, Deserialize)]
 struct ApiErrorResponse {
@@ -178,6 +210,11 @@ impl TryFrom<CompletionResponse> for completion::CompletionResponse<CompletionRe
                 content,
             } => Ok(completion::CompletionResponse {
                 choice: OneOrMany::one(content.clone().into()),
+                usage: completion::Usage {
+                    input_tokens: response.usage.prompt_tokens as u64,
+                    output_tokens: response.usage.completion_tokens as u64,
+                    total_tokens: response.usage.total_tokens as u64,
+                },
                 raw_response: response,
             }),
             _ => Err(CompletionError::ResponseError(
@@ -271,7 +308,7 @@ impl TryFrom<message::Message> for Message {
                 }
             }
 
-            message::Message::Assistant { content } => {
+            message::Message::Assistant { content, .. } => {
                 let collapsed_content = content
                     .into_iter()
                     .map(|content| {
@@ -310,6 +347,7 @@ impl From<Message> for message::Message {
 
 impl completion::CompletionModel for CompletionModel {
     type Response = CompletionResponse;
+    type StreamingResponse = openai::StreamingCompletionResponse;
 
     #[cfg_attr(feature = "worker", worker::send)]
     async fn completion(
@@ -340,10 +378,8 @@ impl completion::CompletionModel for CompletionModel {
             Err(CompletionError::ProviderError(response.text().await?))
         }
     }
-}
 
-impl StreamingCompletionModel for CompletionModel {
-    type StreamingResponse = openai::StreamingCompletionResponse;
+    #[cfg_attr(feature = "worker", worker::send)]
     async fn stream(
         &self,
         completion_request: completion::CompletionRequest,

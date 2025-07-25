@@ -2,6 +2,7 @@ use anyhow::Result;
 use rig::{
     completion::{Prompt, ToolDefinition},
     embeddings::EmbeddingsBuilder,
+    prelude::*,
     providers::openai::{Client, TEXT_EMBEDDING_ADA_002},
     tool::{Tool, ToolEmbedding, ToolSet},
     vector_store::in_memory_store::InMemoryVectorStore,
@@ -180,7 +181,7 @@ async fn main() -> Result<(), anyhow::Error> {
         .multi_turn(10)
         .await?;
 
-    println!("{}", response);
+    println!("{response}");
 
     Ok(())
 }

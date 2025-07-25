@@ -1,5 +1,6 @@
-use rig::providers::xai;
 use rig::Embed;
+use rig::prelude::*;
+use rig::providers::voyageai;
 
 #[derive(Embed, Debug)]
 struct Greetings {
@@ -10,10 +11,9 @@ struct Greetings {
 #[tokio::main]
 async fn main() -> Result<(), anyhow::Error> {
     // Initialize the xAI client
-    let client = xai::Client::from_env();
-
+    let client = voyageai::Client::from_env();
     let embeddings = client
-        .embeddings(xai::embedding::EMBEDDING_V1)
+        .embeddings(voyageai::VOYAGE_3_LARGE)
         .document(Greetings {
             message: "Hello, world!".to_string(),
         })?
@@ -24,7 +24,7 @@ async fn main() -> Result<(), anyhow::Error> {
         .await
         .expect("Failed to embed documents");
 
-    println!("{:?}", embeddings);
+    println!("{embeddings:?}");
 
     Ok(())
 }

@@ -1,11 +1,12 @@
 use anyhow::Result;
-use futures::{stream, StreamExt};
+use futures::{StreamExt, stream};
+use rig::OneOrMany;
 use rig::agent::Agent;
 use rig::completion::{CompletionError, CompletionModel};
 use rig::message::{AssistantContent, UserContent};
-use rig::streaming::{stream_to_stdout, StreamingChat};
+use rig::prelude::*;
+use rig::streaming::{StreamingChat, stream_to_stdout};
 use rig::tool::ToolSetError;
-use rig::OneOrMany;
 use rig::{
     completion::{Message, ToolDefinition},
     providers,
@@ -27,9 +28,9 @@ struct MathError;
 
 #[derive(Deserialize, Serialize)]
 struct Adder;
+
 impl Tool for Adder {
     const NAME: &'static str = "add";
-
     type Error = MathError;
     type Args = OperationArgs;
     type Output = i32;
@@ -50,7 +51,7 @@ impl Tool for Adder {
                         "description": "The second number to add"
                     }
                 },
-                "required": ["x", "y"]
+                "required": ["x", "y"],
             }),
         }
     }
@@ -63,9 +64,9 @@ impl Tool for Adder {
 
 #[derive(Deserialize, Serialize)]
 struct Subtract;
+
 impl Tool for Subtract {
     const NAME: &'static str = "subtract";
-
     type Error = MathError;
     type Args = OperationArgs;
     type Output = i32;
@@ -86,7 +87,7 @@ impl Tool for Subtract {
                         "description": "The number to subtract"
                     }
                 },
-                "required": ["x", "y"]
+                "required": ["x", "y"],
             }
         }))
         .expect("Tool Definition")
@@ -107,7 +108,6 @@ async fn tool_call_helper<M: CompletionModel>(
     let (tool_calls, _): (Vec<_>, Vec<_>) = choice
         .iter()
         .partition(|choice| matches!(choice, AssistantContent::ToolCall(_)));
-
     let tool_content = stream::iter(tool_calls)
         .then(async |choice| {
             if let AssistantContent::ToolCall(tool_call) = choice {
@@ -118,10 +118,18 @@ async fn tool_call_helper<M: CompletionModel>(
                         tool_call.function.arguments.to_string(),
                     )
                     .await?;
-                Ok(UserContent::tool_result(
-                    tool_call.id.clone(),
-                    OneOrMany::one(output.into()),
-                ))
+                if let Some(call_id) = tool_call.call_id.clone() {
+                    Ok(UserContent::tool_result_with_call_id(
+                        tool_call.id.clone(),
+                        call_id,
+                        OneOrMany::one(output.into()),
+                    ))
+                } else {
+                    Ok(UserContent::tool_result(
+                        tool_call.id.clone(),
+                        OneOrMany::one(output.into()),
+                    ))
+                }
             } else {
                 unreachable!("This should never happen as we already filtered for `ToolCall`")
             }
@@ -131,20 +139,20 @@ async fn tool_call_helper<M: CompletionModel>(
         .into_iter()
         .collect::<Result<Vec<_>, _>>()
         .map_err(|e| CompletionError::RequestError(Box::new(e)))?;
-
     Ok(OneOrMany::many(tool_content).expect("Should always have at least one tool call"))
 }
 
 #[tokio::main]
 async fn main() -> Result<(), anyhow::Error> {
     tracing_subscriber::fmt().init();
+
     // Create agent with a single context prompt and two tools
     let calculator_agent = providers::openai::Client::from_env()
         .agent(providers::openai::GPT_4O)
         .preamble(
-            "You are a calculator here to help the user perform arithmetic 
-            operations. Use the tools provided to answer the user's question. 
-            make your answer long, so we can test the streaming functionality, 
+            "You are a calculator here to help the user perform arithmetic
+            operations. Use the tools provided to answer the user's question.
+            make your answer long, so we can test the streaming functionality,
             like 20 words",
         )
         .max_tokens(1024)
@@ -165,7 +173,6 @@ async fn main() -> Result<(), anyhow::Error> {
 
     println!("Message: {:?}", stream.choice);
     chat_history.push(stream.choice.clone().into());
-
     let tool_results = tool_call_helper(stream.choice, &calculator_agent).await?;
 
     let mut stream = calculator_agent

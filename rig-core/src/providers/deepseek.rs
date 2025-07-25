@@ -9,19 +9,22 @@
 //! let deepseek_chat = client.completion_model(deepseek::DEEPSEEK_CHAT);
 //! ```
 
+use futures::StreamExt;
+use std::collections::HashMap;
+
+use crate::client::{CompletionClient, ProviderClient};
 use crate::json_utils::merge;
-use crate::providers::openai;
-use crate::providers::openai::send_compatible_streaming_request;
-use crate::streaming::{StreamingCompletionModel, StreamingCompletionResponse};
+use crate::message::Document;
 use crate::{
+    OneOrMany,
     completion::{self, CompletionError, CompletionModel, CompletionRequest},
-    extractor::ExtractorBuilder,
-    json_utils, message, OneOrMany,
+    impl_conversion_traits, json_utils, message,
 };
 use reqwest::Client as HttpClient;
-use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use serde_json::json;
+
+use super::openai::StreamingToolCall;
 
 // ================================================================
 // Main DeepSeek Client
@@ -31,7 +34,18 @@ const DEEPSEEK_API_BASE_URL: &str = "https://api.deepseek.com";
 #[derive(Clone)]
 pub struct Client {
     pub base_url: String,
+    api_key: String,
     http_client: HttpClient,
+}
+
+impl std::fmt::Debug for Client {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Client")
+            .field("base_url", &self.base_url)
+            .field("http_client", &self.http_client)
+            .field("api_key", &"<REDACTED>")
+            .finish()
+    }
 }
 
 impl Client {
@@ -40,59 +54,65 @@ impl Client {
         Self::from_url(api_key, DEEPSEEK_API_BASE_URL)
     }
 
-    // If you prefer the environment variable approach:
-    pub fn from_env() -> Self {
-        let api_key = std::env::var("DEEPSEEK_API_KEY").expect("DEEPSEEK_API_KEY not set");
-        Self::new(&api_key)
-    }
-
-    // Handy for advanced usage, e.g. letting user override base_url or set timeouts:
+    /// Set your own URL.
+    /// Useful if you need to access an alternative website that supports the DeepSeek API specification.
     pub fn from_url(api_key: &str, base_url: &str) -> Self {
-        // Possibly configure a custom HTTP client here if needed.
         Self {
             base_url: base_url.to_string(),
+            api_key: api_key.to_string(),
             http_client: reqwest::Client::builder()
-                .default_headers({
-                    let mut headers = reqwest::header::HeaderMap::new();
-                    headers.insert(
-                        "Authorization",
-                        format!("Bearer {}", api_key)
-                            .parse()
-                            .expect("Bearer token should parse"),
-                    );
-                    headers
-                })
                 .build()
                 .expect("DeepSeek reqwest client should build"),
         }
     }
 
-    fn post(&self, path: &str) -> reqwest::RequestBuilder {
-        let url = format!("{}/{}", self.base_url, path).replace("//", "/");
-        self.http_client.post(url)
+    /// Use your own `reqwest::Client`.
+    /// The required headers will be automatically attached upon trying to make a request.
+    pub fn with_custom_client(mut self, client: reqwest::Client) -> Self {
+        self.http_client = client;
+
+        self
     }
 
+    fn post(&self, path: &str) -> reqwest::RequestBuilder {
+        let url = format!("{}/{}", self.base_url, path).replace("//", "/");
+        self.http_client.post(url).bearer_auth(&self.api_key)
+    }
+}
+
+impl ProviderClient for Client {
+    // If you prefer the environment variable approach:
+    fn from_env() -> Self {
+        let api_key = std::env::var("DEEPSEEK_API_KEY").expect("DEEPSEEK_API_KEY not set");
+        Self::new(&api_key)
+    }
+
+    fn from_val(input: crate::client::ProviderValue) -> Self {
+        let crate::client::ProviderValue::Simple(api_key) = input else {
+            panic!("Incorrect provider value type")
+        };
+        Self::new(&api_key)
+    }
+}
+
+impl CompletionClient for Client {
+    type CompletionModel = DeepSeekCompletionModel;
+
     /// Creates a DeepSeek completion model with the given `model_name`.
-    pub fn completion_model(&self, model_name: &str) -> DeepSeekCompletionModel {
+    fn completion_model(&self, model_name: &str) -> DeepSeekCompletionModel {
         DeepSeekCompletionModel {
             client: self.clone(),
             model: model_name.to_string(),
         }
     }
-
-    /// Optionally add an agent() convenience:
-    pub fn agent(&self, model_name: &str) -> crate::agent::AgentBuilder<DeepSeekCompletionModel> {
-        crate::agent::AgentBuilder::new(self.completion_model(model_name))
-    }
-
-    /// Create an extractor builder with the given completion model.
-    pub fn extractor<T: JsonSchema + for<'a> Deserialize<'a> + Serialize + Send + Sync>(
-        &self,
-        model: &str,
-    ) -> ExtractorBuilder<T, DeepSeekCompletionModel> {
-        ExtractorBuilder::new(self.completion_model(model))
-    }
 }
+
+impl_conversion_traits!(
+    AsEmbeddings,
+    AsTranscription,
+    AsImageGeneration,
+    AsAudioGeneration for Client
+);
 
 #[derive(Debug, Deserialize)]
 struct ApiErrorResponse {
@@ -117,7 +137,47 @@ impl From<ApiErrorResponse> for CompletionError {
 pub struct CompletionResponse {
     // We'll match the JSON:
     pub choices: Vec<Choice>,
-    // you may want usage or other fields
+    pub usage: Usage,
+    // you may want other fields
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, Default)]
+pub struct Usage {
+    pub completion_tokens: u32,
+    pub prompt_tokens: u32,
+    pub prompt_cache_hit_tokens: u32,
+    pub prompt_cache_miss_tokens: u32,
+    pub total_tokens: u32,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub completion_tokens_details: Option<CompletionTokensDetails>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub prompt_tokens_details: Option<PromptTokensDetails>,
+}
+
+impl Usage {
+    fn new() -> Self {
+        Self {
+            completion_tokens: 0,
+            prompt_tokens: 0,
+            prompt_cache_hit_tokens: 0,
+            prompt_cache_miss_tokens: 0,
+            total_tokens: 0,
+            completion_tokens_details: None,
+            prompt_tokens_details: None,
+        }
+    }
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, Default)]
+pub struct CompletionTokensDetails {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub reasoning_tokens: Option<u32>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, Default)]
+pub struct PromptTokensDetails {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub cached_tokens: Option<u32>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
@@ -227,6 +287,12 @@ impl TryFrom<message::Message> for Vec<Message> {
                             content: text.text,
                             name: None,
                         }),
+                        message::UserContent::Document(Document { data, .. }) => {
+                            Some(Message::User {
+                                content: data,
+                                name: None,
+                            })
+                        }
                         _ => None,
                     })
                     .collect::<Vec<_>>();
@@ -234,7 +300,7 @@ impl TryFrom<message::Message> for Vec<Message> {
 
                 Ok(messages)
             }
-            message::Message::Assistant { content } => {
+            message::Message::Assistant { content, .. } => {
                 let mut messages: Vec<Message> = vec![];
 
                 // extract tool calls
@@ -361,8 +427,15 @@ impl TryFrom<CompletionResponse> for completion::CompletionResponse<CompletionRe
             )
         })?;
 
+        let usage = completion::Usage {
+            input_tokens: response.usage.prompt_tokens as u64,
+            output_tokens: response.usage.completion_tokens as u64,
+            total_tokens: response.usage.total_tokens as u64,
+        };
+
         Ok(completion::CompletionResponse {
             choice,
+            usage,
             raw_response: response,
         })
     }
@@ -382,9 +455,11 @@ impl DeepSeekCompletionModel {
     ) -> Result<serde_json::Value, CompletionError> {
         // Build up the order of messages (context, chat_history, prompt)
         let mut partial_history = vec![];
+
         if let Some(docs) = completion_request.normalized_documents() {
             partial_history.push(docs);
         }
+
         partial_history.extend(completion_request.chat_history);
 
         // Initialize full history with preamble (or empty if non-existent)
@@ -431,6 +506,7 @@ impl DeepSeekCompletionModel {
 
 impl CompletionModel for DeepSeekCompletionModel {
     type Response = CompletionResponse;
+    type StreamingResponse = StreamingCompletionResponse;
 
     #[cfg_attr(feature = "worker", worker::send)]
     async fn completion(
@@ -441,6 +517,8 @@ impl CompletionModel for DeepSeekCompletionModel {
         crate::completion::CompletionError,
     > {
         let request = self.create_completion_request(completion_request)?;
+
+        tracing::debug!("DeepSeek completion request: {request:?}");
 
         let response = self
             .client
@@ -461,14 +539,15 @@ impl CompletionModel for DeepSeekCompletionModel {
             Err(CompletionError::ProviderError(response.text().await?))
         }
     }
-}
 
-impl StreamingCompletionModel for DeepSeekCompletionModel {
-    type StreamingResponse = openai::StreamingCompletionResponse;
+    #[cfg_attr(feature = "worker", worker::send)]
     async fn stream(
         &self,
         completion_request: CompletionRequest,
-    ) -> Result<StreamingCompletionResponse<Self::StreamingResponse>, CompletionError> {
+    ) -> Result<
+        crate::streaming::StreamingCompletionResponse<Self::StreamingResponse>,
+        CompletionError,
+    > {
         let mut request = self.create_completion_request(completion_request)?;
 
         request = merge(
@@ -479,6 +558,183 @@ impl StreamingCompletionModel for DeepSeekCompletionModel {
         let builder = self.client.post("/v1/chat/completions").json(&request);
         send_compatible_streaming_request(builder).await
     }
+}
+
+#[derive(Deserialize, Debug)]
+pub struct StreamingDelta {
+    #[serde(default)]
+    content: Option<String>,
+    #[serde(default, deserialize_with = "json_utils::null_or_vec")]
+    tool_calls: Vec<StreamingToolCall>,
+    reasoning_content: Option<String>,
+}
+
+#[derive(Deserialize, Debug)]
+struct StreamingChoice {
+    delta: StreamingDelta,
+}
+
+#[derive(Deserialize, Debug)]
+struct StreamingCompletionChunk {
+    choices: Vec<StreamingChoice>,
+    usage: Option<Usage>,
+}
+
+#[derive(Clone)]
+pub struct StreamingCompletionResponse {
+    pub usage: Usage,
+}
+
+pub async fn send_compatible_streaming_request(
+    request_builder: reqwest::RequestBuilder,
+) -> Result<
+    crate::streaming::StreamingCompletionResponse<StreamingCompletionResponse>,
+    CompletionError,
+> {
+    let response = request_builder.send().await?;
+
+    if !response.status().is_success() {
+        return Err(CompletionError::ProviderError(format!(
+            "{}: {}",
+            response.status(),
+            response.text().await?
+        )));
+    }
+
+    // Handle OpenAI Compatible SSE chunks
+    let inner = Box::pin(async_stream::stream! {
+        let mut stream = response.bytes_stream();
+
+        let mut final_usage = Usage::new();
+        let mut partial_data = None;
+        let mut calls: HashMap<usize, (String, String, String)> = HashMap::new();
+
+        while let Some(chunk_result) = stream.next().await {
+            let chunk = match chunk_result {
+                Ok(c) => c,
+                Err(e) => {
+                    yield Err(CompletionError::from(e));
+                    break;
+                }
+            };
+
+            let text = match String::from_utf8(chunk.to_vec()) {
+                Ok(t) => t,
+                Err(e) => {
+                    yield Err(CompletionError::ResponseError(e.to_string()));
+                    break;
+                }
+            };
+
+
+            for line in text.lines() {
+                let mut line = line.to_string();
+
+                // If there was a remaining part, concat with current line
+                if partial_data.is_some() {
+                    line = format!("{}{}", partial_data.unwrap(), line);
+                    partial_data = None;
+                }
+                // Otherwise full data line
+                else {
+                    let Some(data) = line.strip_prefix("data:") else {
+                        continue;
+                    };
+
+                    let data = data.trim_start();
+
+                    // Partial data, split somewhere in the middle
+                    if !line.ends_with("}") {
+                        partial_data = Some(data.to_string());
+                    } else {
+                        line = data.to_string();
+                    }
+                }
+
+                let data = serde_json::from_str::<StreamingCompletionChunk>(&line);
+
+                let Ok(data) = data else {
+                    let err = data.unwrap_err();
+                    tracing::debug!("Couldn't serialize data as StreamingCompletionChunk: {:?}", err);
+                    continue;
+                };
+
+
+                if let Some(choice) = data.choices.first() {
+                    let delta = &choice.delta;
+
+
+                            if !delta.tool_calls.is_empty() {
+                                for tool_call in &delta.tool_calls {
+                                    let function = tool_call.function.clone();
+                                    // Start of tool call
+                                    // name: Some(String)
+                                    // arguments: None
+                                    if function.name.is_some() && function.arguments.is_empty() {
+                                        let id = tool_call.id.clone().unwrap_or("".to_string());
+
+                                        calls.insert(tool_call.index, (id, function.name.clone().unwrap(), "".to_string()));
+                                    }
+                                    // Part of tool call
+                                    // name: None or Empty String
+                                    // arguments: Some(String)
+                                    else if function.name.clone().is_none_or(|s| s.is_empty()) && !function.arguments.is_empty() {
+                                        let Some((id, name, arguments)) = calls.get(&tool_call.index) else {
+                                            tracing::debug!("Partial tool call received but tool call was never started.");
+                                            continue;
+                                        };
+
+                                        let new_arguments = &function.arguments;
+                                        let arguments = format!("{arguments}{new_arguments}");
+
+                                        calls.insert(tool_call.index, (id.clone(), name.clone(), arguments));
+                                    }
+                                    // Entire tool call
+                                    else {
+                                        let id = tool_call.id.clone().unwrap_or("".to_string());
+                                        let name = function.name.expect("function name should be present for complete tool call");
+                                        let arguments = function.arguments;
+                                        let Ok(arguments) = serde_json::from_str(&arguments) else {
+                                            tracing::debug!("Couldn't serialize '{}' as a json value", arguments);
+                                            continue;
+                                        };
+
+                                        yield Ok(crate::streaming::RawStreamingChoice::ToolCall {id, name, arguments, call_id: None })
+                                    }
+                                }
+                            }
+
+                            if let Some(content) = &delta.reasoning_content {
+                                yield Ok(crate::streaming::RawStreamingChoice::Reasoning { reasoning: content.to_string()})
+                            }
+
+                            if let Some(content) = &delta.content {
+                                yield Ok(crate::streaming::RawStreamingChoice::Message(content.clone()))
+                            }
+
+                }
+
+
+                if let Some(usage) = data.usage {
+                    final_usage = usage.clone();
+                }
+            }
+        }
+
+        for (_, (id, name, arguments)) in calls {
+            let Ok(arguments) = serde_json::from_str(&arguments) else {
+                continue;
+            };
+
+            yield Ok(crate::streaming::RawStreamingChoice::ToolCall {id, name, arguments, call_id: None });
+        }
+
+        yield Ok(crate::streaming::RawStreamingChoice::FinalResponse(StreamingCompletionResponse {
+            usage: final_usage.clone()
+        }))
+    });
+
+    Ok(crate::streaming::StreamingCompletionResponse::stream(inner))
 }
 
 // ================================================================
@@ -515,12 +771,21 @@ mod tests {
 
     #[test]
     fn test_deserialize_deepseek_response() {
-        let data = r#"{"choices":[{
-            "finish_reason": "stop",
-            "index": 0,
-            "logprobs": null,
-            "message":{"role":"assistant","content":"Hello, world!"}
-            }]}"#;
+        let data = r#"{
+            "choices":[{
+                "finish_reason": "stop",
+                "index": 0,
+                "logprobs": null,
+                "message":{"role":"assistant","content":"Hello, world!"}
+            }],
+            "usage": {
+                "completion_tokens": 0,
+                "prompt_tokens": 0,
+                "prompt_cache_hit_tokens": 0,
+                "prompt_cache_miss_tokens": 0,
+                "total_tokens": 0
+            }
+        }"#;
 
         let jd = &mut serde_json::Deserializer::from_str(data);
         let result: Result<CompletionResponse, _> = serde_path_to_error::deserialize(jd);

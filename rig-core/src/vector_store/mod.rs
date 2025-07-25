@@ -1,8 +1,11 @@
 use futures::future::BoxFuture;
+use reqwest::StatusCode;
 use serde::Deserialize;
+use serde::Serialize;
 use serde_json::Value;
 
 use crate::embeddings::EmbeddingError;
+use crate::{Embed, OneOrMany, embeddings::Embedding};
 
 pub mod in_memory_store;
 
@@ -20,6 +23,22 @@ pub enum VectorStoreError {
 
     #[error("Missing Id: {0}")]
     MissingIdError(String),
+
+    #[error("HTTP request error: {0}")]
+    ReqwestError(#[from] reqwest::Error),
+
+    #[error("External call to API returned an error. Error code: {0} Message: {1}")]
+    ExternalAPIError(StatusCode, String),
+}
+
+/// Trait for inserting documents into a vector store.
+pub trait InsertDocuments: Send + Sync {
+    /// Insert documents into the vector store.
+    ///
+    fn insert_documents<Doc: Serialize + Embed + Send>(
+        &self,
+        documents: Vec<(Doc, OneOrMany<Embedding>)>,
+    ) -> impl std::future::Future<Output = Result<(), VectorStoreError>> + Send;
 }
 
 /// Trait for vector store indexes

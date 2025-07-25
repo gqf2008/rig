@@ -3,10 +3,7 @@ use crate::{completion::CompletionModel, types::errors::AwsSdkConverseStreamErro
 use async_stream::stream;
 use aws_sdk_bedrockruntime::types as aws_bedrock;
 use rig::streaming::StreamingCompletionResponse;
-use rig::{
-    completion::CompletionError,
-    streaming::{RawStreamingChoice, StreamingCompletionModel},
-};
+use rig::{completion::CompletionError, streaming::RawStreamingChoice};
 
 #[derive(Default)]
 struct ToolCallState {
@@ -15,13 +12,11 @@ struct ToolCallState {
     input_json: String,
 }
 
-impl StreamingCompletionModel for CompletionModel {
-    type StreamingResponse = ();
-
-    async fn stream(
+impl CompletionModel {
+    pub(crate) async fn stream(
         &self,
         completion_request: rig::completion::CompletionRequest,
-    ) -> Result<StreamingCompletionResponse<Self::StreamingResponse>, CompletionError> {
+    ) -> Result<StreamingCompletionResponse<()>, CompletionError> {
         let request = AwsCompletionRequest(completion_request);
 
         let mut converse_builder = self
@@ -83,6 +78,7 @@ impl StreamingCompletionModel for CompletionModel {
                                     let tool_input = serde_json::from_str(tool_call.input_json.as_str())?;
                                     yield Ok(RawStreamingChoice::ToolCall {
                                         name: tool_call.name,
+                                        call_id: None,
                                         id: tool_call.id,
                                         arguments: tool_input
                                     });
@@ -101,6 +97,6 @@ impl StreamingCompletionModel for CompletionModel {
             }
         });
 
-        Ok(StreamingCompletionResponse::new(stream))
+        Ok(StreamingCompletionResponse::stream(stream))
     }
 }

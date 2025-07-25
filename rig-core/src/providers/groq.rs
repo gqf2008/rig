@@ -8,24 +8,28 @@
 //!
 //! let gpt4o = client.completion_model(groq::GPT_4O);
 //! ```
-use super::openai::{send_compatible_streaming_request, CompletionResponse, TranscriptionResponse};
+use std::collections::HashMap;
+
+use super::openai::{CompletionResponse, StreamingToolCall, TranscriptionResponse, Usage};
+use crate::client::{CompletionClient, TranscriptionClient};
 use crate::json_utils::merge;
-use crate::providers::openai;
-use crate::streaming::{StreamingCompletionModel, StreamingCompletionResponse};
+use futures::StreamExt;
+
+use crate::streaming::RawStreamingChoice;
 use crate::{
-    agent::AgentBuilder,
+    OneOrMany,
     completion::{self, CompletionError, CompletionRequest},
-    extractor::ExtractorBuilder,
     json_utils,
     message::{self, MessageError},
     providers::openai::ToolDefinition,
     transcription::{self, TranscriptionError},
-    OneOrMany,
 };
+use reqwest::RequestBuilder;
 use reqwest::multipart::Part;
-use schemars::JsonSchema;
+use rig::client::ProviderClient;
+use rig::impl_conversion_traits;
 use serde::{Deserialize, Serialize};
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 
 // ================================================================
 // Main Groq Client
@@ -35,7 +39,18 @@ const GROQ_API_BASE_URL: &str = "https://api.groq.com/openai/v1";
 #[derive(Clone)]
 pub struct Client {
     base_url: String,
+    api_key: String,
     http_client: reqwest::Client,
+}
+
+impl std::fmt::Debug for Client {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Client")
+            .field("base_url", &self.base_url)
+            .field("http_client", &self.http_client)
+            .field("api_key", &"<REDACTED>")
+            .finish()
+    }
 }
 
 impl Client {
@@ -48,33 +63,45 @@ impl Client {
     pub fn from_url(api_key: &str, base_url: &str) -> Self {
         Self {
             base_url: base_url.to_string(),
+            api_key: api_key.to_string(),
             http_client: reqwest::Client::builder()
-                .default_headers({
-                    let mut headers = reqwest::header::HeaderMap::new();
-                    headers.insert(
-                        "Authorization",
-                        format!("Bearer {}", api_key)
-                            .parse()
-                            .expect("Bearer token should parse"),
-                    );
-                    headers
-                })
                 .build()
                 .expect("Groq reqwest client should build"),
         }
     }
 
-    /// Create a new Groq client from the `GROQ_API_KEY` environment variable.
-    /// Panics if the environment variable is not set.
-    pub fn from_env() -> Self {
-        let api_key = std::env::var("GROQ_API_KEY").expect("GROQ_API_KEY not set");
-        Self::new(&api_key)
+    /// Use your own `reqwest::Client`.
+    /// The required headers will be automatically attached upon trying to make a request.
+    pub fn with_custom_client(mut self, client: reqwest::Client) -> Self {
+        self.http_client = client;
+
+        self
     }
 
     fn post(&self, path: &str) -> reqwest::RequestBuilder {
         let url = format!("{}/{}", self.base_url, path).replace("//", "/");
-        self.http_client.post(url)
+        self.http_client.post(url).bearer_auth(&self.api_key)
     }
+}
+
+impl ProviderClient for Client {
+    /// Create a new Groq client from the `GROQ_API_KEY` environment variable.
+    /// Panics if the environment variable is not set.
+    fn from_env() -> Self {
+        let api_key = std::env::var("GROQ_API_KEY").expect("GROQ_API_KEY not set");
+        Self::new(&api_key)
+    }
+
+    fn from_val(input: crate::client::ProviderValue) -> Self {
+        let crate::client::ProviderValue::Simple(api_key) = input else {
+            panic!("Incorrect provider value type")
+        };
+        Self::new(&api_key)
+    }
+}
+
+impl CompletionClient for Client {
+    type CompletionModel = CompletionModel;
 
     /// Create a completion model with the given name.
     ///
@@ -87,9 +114,13 @@ impl Client {
     ///
     /// let gpt4 = groq.completion_model(groq::GPT_4);
     /// ```
-    pub fn completion_model(&self, model: &str) -> CompletionModel {
+    fn completion_model(&self, model: &str) -> CompletionModel {
         CompletionModel::new(self.clone(), model)
     }
+}
+
+impl TranscriptionClient for Client {
+    type TranscriptionModel = TranscriptionModel;
 
     /// Create a transcription model with the given name.
     ///
@@ -102,36 +133,16 @@ impl Client {
     ///
     /// let gpt4 = groq.transcription_model(groq::WHISPER_LARGE_V3);
     /// ```
-    pub fn transcription_model(&self, model: &str) -> TranscriptionModel {
+    fn transcription_model(&self, model: &str) -> TranscriptionModel {
         TranscriptionModel::new(self.clone(), model)
     }
-
-    /// Create an agent builder with the given completion model.
-    ///
-    /// # Example
-    /// ```
-    /// use rig::providers::groq::{Client, self};
-    ///
-    /// // Initialize the Groq client
-    /// let groq = Client::new("your-groq-api-key");
-    ///
-    /// let agent = groq.agent(groq::GPT_4)
-    ///    .preamble("You are comedian AI with a mission to make people laugh.")
-    ///    .temperature(0.0)
-    ///    .build();
-    /// ```
-    pub fn agent(&self, model: &str) -> AgentBuilder<CompletionModel> {
-        AgentBuilder::new(self.completion_model(model))
-    }
-
-    /// Create an extractor builder with the given completion model.
-    pub fn extractor<T: JsonSchema + for<'a> Deserialize<'a> + Serialize + Send + Sync>(
-        &self,
-        model: &str,
-    ) -> ExtractorBuilder<T, CompletionModel> {
-        ExtractorBuilder::new(self.completion_model(model))
-    }
 }
+
+impl_conversion_traits!(
+    AsEmbeddings,
+    AsImageGeneration,
+    AsAudioGeneration for Client
+);
 
 #[derive(Debug, Deserialize)]
 struct ApiErrorResponse {
@@ -149,6 +160,8 @@ enum ApiResponse<T> {
 pub struct Message {
     pub role: String,
     pub content: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub reasoning: Option<String>,
 }
 
 impl TryFrom<Message> for message::Message {
@@ -167,6 +180,7 @@ impl TryFrom<Message> for message::Message {
                 ),
             }),
             "assistant" => Ok(Self::Assistant {
+                id: None,
                 content: OneOrMany::one(
                     message
                         .content
@@ -197,9 +211,11 @@ impl TryFrom<message::Message> for Message {
                     message::UserContent::Text(text) => Some(text.text.clone()),
                     _ => None,
                 }),
+                reasoning: None,
             }),
-            message::Message::Assistant { content } => {
+            message::Message::Assistant { content, .. } => {
                 let mut text_content: Option<String> = None;
+                let mut groq_reasoning: Option<String> = None;
 
                 for c in content.iter() {
                     match c {
@@ -217,7 +233,10 @@ impl TryFrom<message::Message> for Message {
                         message::AssistantContent::ToolCall(_tool_call) => {
                             return Err(MessageError::ConversionError(
                                 "Tool calls do not exist on this message".into(),
-                            ))
+                            ));
+                        }
+                        message::AssistantContent::Reasoning(message::Reasoning { reasoning }) => {
+                            groq_reasoning = Some(reasoning.to_owned());
                         }
                     }
                 }
@@ -225,6 +244,7 @@ impl TryFrom<message::Message> for Message {
                 Ok(Self {
                     role: "assistant".to_string(),
                     content: text_content,
+                    reasoning: groq_reasoning,
                 })
             }
         }
@@ -261,7 +281,7 @@ pub const LLAMA_3_8B_8192: &str = "llama3-8b-8192";
 /// The `mixtral-8x7b-32768` model. Used for chat completion.
 pub const MIXTRAL_8X7B_32768: &str = "mixtral-8x7b-32768";
 
-#[derive(Clone)]
+#[derive(Clone, Debug)]
 pub struct CompletionModel {
     client: Client,
     /// Name of the model (e.g.: deepseek-r1-distill-llama-70b)
@@ -295,6 +315,7 @@ impl CompletionModel {
                     vec![Message {
                         role: "system".to_string(),
                         content: Some(preamble),
+                        reasoning: None,
                     }]
                 });
 
@@ -319,6 +340,7 @@ impl CompletionModel {
                 "temperature": completion_request.temperature,
                 "tools": completion_request.tools.into_iter().map(ToolDefinition::from).collect::<Vec<_>>(),
                 "tool_choice": "auto",
+                "reasoning_format": "parsed"
             })
         };
 
@@ -334,6 +356,7 @@ impl CompletionModel {
 
 impl completion::CompletionModel for CompletionModel {
     type Response = CompletionResponse;
+    type StreamingResponse = StreamingCompletionResponse;
 
     #[cfg_attr(feature = "worker", worker::send)]
     async fn completion(
@@ -364,14 +387,15 @@ impl completion::CompletionModel for CompletionModel {
             Err(CompletionError::ProviderError(response.text().await?))
         }
     }
-}
 
-impl StreamingCompletionModel for CompletionModel {
-    type StreamingResponse = openai::StreamingCompletionResponse;
+    #[cfg_attr(feature = "worker", worker::send)]
     async fn stream(
         &self,
         request: CompletionRequest,
-    ) -> Result<StreamingCompletionResponse<Self::StreamingResponse>, CompletionError> {
+    ) -> Result<
+        crate::streaming::StreamingCompletionResponse<Self::StreamingResponse>,
+        CompletionError,
+    > {
         let mut request = self.create_completion_request(request)?;
 
         request = merge(
@@ -466,4 +490,191 @@ impl transcription::TranscriptionModel for TranscriptionModel {
             Err(TranscriptionError::ProviderError(response.text().await?))
         }
     }
+}
+
+#[derive(Deserialize, Debug)]
+#[serde(untagged)]
+pub enum StreamingDelta {
+    Reasoning {
+        reasoning: String,
+    },
+    MessageContent {
+        #[serde(default)]
+        content: Option<String>,
+        #[serde(default, deserialize_with = "json_utils::null_or_vec")]
+        tool_calls: Vec<StreamingToolCall>,
+    },
+}
+
+#[derive(Deserialize, Debug)]
+struct StreamingChoice {
+    delta: StreamingDelta,
+}
+
+#[derive(Deserialize, Debug)]
+struct StreamingCompletionChunk {
+    choices: Vec<StreamingChoice>,
+    usage: Option<Usage>,
+}
+
+#[derive(Clone)]
+pub struct StreamingCompletionResponse {
+    pub usage: Usage,
+}
+
+pub async fn send_compatible_streaming_request(
+    request_builder: RequestBuilder,
+) -> Result<
+    crate::streaming::StreamingCompletionResponse<StreamingCompletionResponse>,
+    CompletionError,
+> {
+    let response = request_builder.send().await?;
+
+    if !response.status().is_success() {
+        return Err(CompletionError::ProviderError(format!(
+            "{}: {}",
+            response.status(),
+            response.text().await?
+        )));
+    }
+
+    // Handle OpenAI Compatible SSE chunks
+    let inner = Box::pin(async_stream::stream! {
+        let mut stream = response.bytes_stream();
+
+        let mut final_usage = Usage {
+            prompt_tokens: 0,
+            total_tokens: 0
+        };
+
+        let mut partial_data = None;
+        let mut calls: HashMap<usize, (String, String, String)> = HashMap::new();
+
+        while let Some(chunk_result) = stream.next().await {
+            let chunk = match chunk_result {
+                Ok(c) => c,
+                Err(e) => {
+                    yield Err(CompletionError::from(e));
+                    break;
+                }
+            };
+
+            let text = match String::from_utf8(chunk.to_vec()) {
+                Ok(t) => t,
+                Err(e) => {
+                    yield Err(CompletionError::ResponseError(e.to_string()));
+                    break;
+                }
+            };
+
+
+            for line in text.lines() {
+                let mut line = line.to_string();
+
+                // If there was a remaining part, concat with current line
+                if partial_data.is_some() {
+                    line = format!("{}{}", partial_data.unwrap(), line);
+                    partial_data = None;
+                }
+                // Otherwise full data line
+                else {
+                    let Some(data) = line.strip_prefix("data:") else {
+                        continue;
+                    };
+
+                    let data = data.trim_start();
+
+                    // Partial data, split somewhere in the middle
+                    if !line.ends_with("}") {
+                        partial_data = Some(data.to_string());
+                    } else {
+                        line = data.to_string();
+                    }
+                }
+
+                let data = serde_json::from_str::<StreamingCompletionChunk>(&line);
+
+                let Ok(data) = data else {
+                    let err = data.unwrap_err();
+                    tracing::debug!("Couldn't serialize data as StreamingCompletionChunk: {:?}", err);
+                    continue;
+                };
+
+
+                if let Some(choice) = data.choices.first() {
+                    let delta = &choice.delta;
+
+                    match delta {
+                        StreamingDelta::Reasoning { reasoning } => {
+                            yield Ok(crate::streaming::RawStreamingChoice::Reasoning { reasoning: reasoning.to_string() })
+                        },
+                        StreamingDelta::MessageContent { content, tool_calls } => {
+                            if !tool_calls.is_empty() {
+                                for tool_call in tool_calls {
+                                    let function = tool_call.function.clone();
+                                    // Start of tool call
+                                    // name: Some(String)
+                                    // arguments: None
+                                    if function.name.is_some() && function.arguments.is_empty() {
+                                        let id = tool_call.id.clone().unwrap_or("".to_string());
+
+                                        calls.insert(tool_call.index, (id, function.name.clone().unwrap(), "".to_string()));
+                                    }
+                                    // Part of tool call
+                                    // name: None or Empty String
+                                    // arguments: Some(String)
+                                    else if function.name.clone().is_none_or(|s| s.is_empty()) && !function.arguments.is_empty() {
+                                        let Some((id, name, arguments)) = calls.get(&tool_call.index) else {
+                                            tracing::debug!("Partial tool call received but tool call was never started.");
+                                            continue;
+                                        };
+
+                                        let new_arguments = &function.arguments;
+                                        let arguments = format!("{arguments}{new_arguments}");
+
+                                        calls.insert(tool_call.index, (id.clone(), name.clone(), arguments));
+                                    }
+                                    // Entire tool call
+                                    else {
+                                        let id = tool_call.id.clone().unwrap_or("".to_string());
+                                        let name = function.name.expect("function name should be present for complete tool call");
+                                        let arguments = function.arguments;
+                                        let Ok(arguments) = serde_json::from_str(&arguments) else {
+                                            tracing::debug!("Couldn't serialize '{}' as a json value", arguments);
+                                            continue;
+                                        };
+
+                                        yield Ok(crate::streaming::RawStreamingChoice::ToolCall {id, name, arguments, call_id: None })
+                                    }
+                                }
+                            }
+
+                            if let Some(content) = &content {
+                                yield Ok(crate::streaming::RawStreamingChoice::Message(content.clone()))
+                            }
+                        }
+                    }
+                }
+
+
+                if let Some(usage) = data.usage {
+                    final_usage = usage.clone();
+                }
+            }
+        }
+
+        for (_, (id, name, arguments)) in calls {
+            let Ok(arguments) = serde_json::from_str(&arguments) else {
+                continue;
+            };
+
+            yield Ok(RawStreamingChoice::ToolCall {id, name, arguments, call_id: None });
+        }
+
+        yield Ok(RawStreamingChoice::FinalResponse(StreamingCompletionResponse {
+            usage: final_usage.clone()
+        }))
+    });
+
+    Ok(crate::streaming::StreamingCompletionResponse::stream(inner))
 }

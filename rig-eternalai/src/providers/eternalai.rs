@@ -11,17 +11,20 @@
 
 use crate::eternalai_system_prompt_manager_toolset;
 use crate::json_utils;
+use async_stream::stream;
+use rig::OneOrMany;
 use rig::agent::AgentBuilder;
 use rig::completion::{CompletionError, CompletionRequest};
 use rig::embeddings::{EmbeddingError, EmbeddingsBuilder};
 use rig::extractor::ExtractorBuilder;
 use rig::message;
+use rig::message::AssistantContent;
 use rig::providers::openai::{self, Message};
-use rig::OneOrMany;
-use rig::{completion, embeddings, Embed};
+use rig::streaming::{RawStreamingChoice, StreamingCompletionResponse};
+use rig::{Embed, completion, embeddings};
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 use std::ffi::c_uint;
 use std::time::Duration;
 
@@ -51,7 +54,7 @@ impl Client {
                     let mut headers = reqwest::header::HeaderMap::new();
                     headers.insert(
                         "Authorization",
-                        format!("Bearer {}", api_key)
+                        format!("Bearer {api_key}")
                             .parse()
                             .expect("Bearer token should parse"),
                     );
@@ -335,7 +338,7 @@ pub fn get_chain_id(key: &str) -> Option<&str> {
     None
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, Clone)]
 pub struct CompletionResponse {
     pub id: String,
     pub object: String,
@@ -402,15 +405,25 @@ impl TryFrom<CompletionResponse> for completion::CompletionResponse<CompletionRe
                 "Response contained no message or tool call (empty)".to_owned(),
             )
         })?;
+        let usage = response
+            .usage
+            .as_ref()
+            .map(|usage| completion::Usage {
+                input_tokens: usage.prompt_tokens as u64,
+                output_tokens: (usage.total_tokens - usage.prompt_tokens) as u64,
+                total_tokens: usage.total_tokens as u64,
+            })
+            .unwrap_or_default();
 
         Ok(completion::CompletionResponse {
             choice,
+            usage,
             raw_response: response,
         })
     }
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, Clone)]
 pub struct Choice {
     pub index: usize,
     pub message: Message,
@@ -466,6 +479,7 @@ impl CompletionModel {
 
 impl completion::CompletionModel for CompletionModel {
     type Response = CompletionResponse;
+    type StreamingResponse = CompletionResponse;
 
     async fn completion(
         &self,
@@ -586,5 +600,37 @@ impl completion::CompletionModel for CompletionModel {
         } else {
             Err(CompletionError::ProviderError(response.text().await?))
         }
+    }
+
+    async fn stream(
+        &self,
+        request: CompletionRequest,
+    ) -> Result<StreamingCompletionResponse<Self::StreamingResponse>, CompletionError> {
+        let resp = self.completion(request).await?;
+
+        let stream = Box::pin(stream! {
+            for c in resp.choice {
+                match &c {
+                    AssistantContent::Text(text) => {
+                        yield Ok(RawStreamingChoice::Message(text.text.clone()))
+                    }
+                    AssistantContent::ToolCall(tc) => {
+                        yield Ok(RawStreamingChoice::ToolCall {
+                            id: tc.id.clone(),
+                            call_id: None,
+                            name: tc.function.name.clone(),
+                            arguments: tc.function.arguments.clone(),
+                        })
+                    }
+                    AssistantContent::Reasoning(_) => {
+                        unimplemented!("Reasoning is currently unimplemented on Eternal AI. If you need this, please open a ticket!")
+                    }
+                }
+            }
+
+            yield Ok(RawStreamingChoice::FinalResponse(resp.raw_response.clone()));
+        });
+
+        Ok(StreamingCompletionResponse::stream(stream))
     }
 }

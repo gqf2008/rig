@@ -1,21 +1,15 @@
-use std::collections::HashMap;
-
-use futures::{stream, StreamExt, TryStreamExt};
-
+use super::prompt_request::{self, PromptRequest};
 use crate::{
     completion::{
         Chat, Completion, CompletionError, CompletionModel, CompletionRequestBuilder, Document,
         Message, Prompt, PromptError,
     },
-    streaming::{
-        StreamingChat, StreamingCompletion, StreamingCompletionModel, StreamingCompletionResponse,
-        StreamingPrompt,
-    },
+    streaming::{StreamingChat, StreamingCompletion, StreamingCompletionResponse, StreamingPrompt},
     tool::ToolSet,
     vector_store::VectorStoreError,
 };
-
-use super::prompt_request::PromptRequest;
+use futures::{StreamExt, TryStreamExt, stream};
+use std::collections::HashMap;
 
 /// Struct representing an LLM agent. An agent is an LLM model combined with a preamble
 /// (i.e.: system prompt) and a static set of context documents and tools.
@@ -195,14 +189,20 @@ impl<M: CompletionModel> Completion<M> for Agent<M> {
 
 #[allow(refining_impl_trait)]
 impl<M: CompletionModel> Prompt for Agent<M> {
-    fn prompt(&self, prompt: impl Into<Message> + Send) -> PromptRequest<M> {
+    fn prompt(
+        &self,
+        prompt: impl Into<Message> + Send,
+    ) -> PromptRequest<prompt_request::Standard, M> {
         PromptRequest::new(self, prompt)
     }
 }
 
 #[allow(refining_impl_trait)]
 impl<M: CompletionModel> Prompt for &Agent<M> {
-    fn prompt(&self, prompt: impl Into<Message> + Send) -> PromptRequest<M> {
+    fn prompt(
+        &self,
+        prompt: impl Into<Message> + Send,
+    ) -> PromptRequest<prompt_request::Standard, M> {
         PromptRequest::new(*self, prompt)
     }
 }
@@ -221,7 +221,7 @@ impl<M: CompletionModel> Chat for Agent<M> {
     }
 }
 
-impl<M: StreamingCompletionModel> StreamingCompletion<M> for Agent<M> {
+impl<M: CompletionModel> StreamingCompletion<M> for Agent<M> {
     async fn stream_completion(
         &self,
         prompt: impl Into<Message> + Send,
@@ -233,7 +233,7 @@ impl<M: StreamingCompletionModel> StreamingCompletion<M> for Agent<M> {
     }
 }
 
-impl<M: StreamingCompletionModel> StreamingPrompt<M::StreamingResponse> for Agent<M> {
+impl<M: CompletionModel> StreamingPrompt<M::StreamingResponse> for Agent<M> {
     async fn stream_prompt(
         &self,
         prompt: impl Into<Message> + Send,
@@ -242,7 +242,7 @@ impl<M: StreamingCompletionModel> StreamingPrompt<M::StreamingResponse> for Agen
     }
 }
 
-impl<M: StreamingCompletionModel> StreamingChat<M::StreamingResponse> for Agent<M> {
+impl<M: CompletionModel> StreamingChat<M::StreamingResponse> for Agent<M> {
     async fn stream_chat(
         &self,
         prompt: impl Into<Message> + Send,

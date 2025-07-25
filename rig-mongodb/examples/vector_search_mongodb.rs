@@ -1,15 +1,16 @@
 use mongodb::{
+    Client as MongoClient, Collection,
     bson::{self, doc},
     options::ClientOptions,
-    Client as MongoClient, Collection,
 };
 use rig::providers::openai::TEXT_EMBEDDING_ADA_002;
 use serde::{Deserialize, Deserializer};
 use serde_json::Value;
 use std::env;
 
+use rig::client::EmbeddingsClient;
 use rig::{
-    embeddings::EmbeddingsBuilder, providers::openai::Client, vector_store::VectorStoreIndex, Embed,
+    Embed, embeddings::EmbeddingsBuilder, providers::openai::Client, vector_store::VectorStoreIndex,
 };
 use rig_mongodb::{MongoDbVectorIndex, SearchParams};
 
@@ -102,7 +103,7 @@ async fn main() -> Result<(), anyhow::Error> {
 
     match collection.insert_many(mongo_documents).await {
         Ok(_) => println!("Documents added successfully"),
-        Err(e) => println!("Error adding documents: {:?}", e),
+        Err(e) => println!("Error adding documents: {e:?}"),
     };
 
     // Create a vector index on our vector store.
@@ -114,7 +115,7 @@ async fn main() -> Result<(), anyhow::Error> {
     // Query the index
     let results = index.top_n::<Word>("What is a linglingdong?", 1).await?;
 
-    println!("Results: {:?}", results);
+    println!("Results: {results:?}");
 
     let id_results = index
         .top_n_ids("What is a linglingdong?", 1)
@@ -122,7 +123,7 @@ async fn main() -> Result<(), anyhow::Error> {
         .into_iter()
         .collect::<Vec<_>>();
 
-    println!("ID results: {:?}", id_results);
+    println!("ID results: {id_results:?}");
 
     Ok(())
 }

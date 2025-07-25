@@ -1,13 +1,13 @@
 use qdrant_client::{
-    qdrant::{
-        point_id::PointIdOptions, PointId, PointStruct, Query, QueryPoints, UpsertPointsBuilder,
-    },
     Payload, Qdrant,
+    qdrant::{
+        PointId, PointStruct, Query, QueryPoints, UpsertPointsBuilder, point_id::PointIdOptions,
+    },
 };
 use rig::{
-    embeddings::{Embedding, EmbeddingModel},
-    vector_store::{VectorStoreError, VectorStoreIndex},
     Embed, OneOrMany,
+    embeddings::{Embedding, EmbeddingModel},
+    vector_store::{InsertDocuments, VectorStoreError, VectorStoreIndex},
 };
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
@@ -55,8 +55,13 @@ impl<M: EmbeddingModel> QdrantVectorStore<M> {
         params.limit = Some(limit as u64);
         params
     }
+}
 
-    pub async fn insert_documents<Doc: Serialize + Embed + Send>(
+impl<Model> InsertDocuments for QdrantVectorStore<Model>
+where
+    Model: EmbeddingModel + Send + Sync,
+{
+    async fn insert_documents<Doc: Serialize + Embed + Send>(
         &self,
         documents: Vec<(Doc, OneOrMany<Embedding>)>,
     ) -> Result<(), VectorStoreError> {

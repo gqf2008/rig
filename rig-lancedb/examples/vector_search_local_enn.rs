@@ -2,6 +2,7 @@ use std::sync::Arc;
 
 use arrow_array::RecordBatchIterator;
 use fixture::{as_record_batch, schema, words};
+use rig::client::{EmbeddingsClient, ProviderClient};
 use rig::{
     embeddings::{EmbeddingModel, EmbeddingsBuilder},
     providers::openai::{Client, TEXT_EMBEDDING_ADA_002},
@@ -58,7 +59,7 @@ async fn main() -> Result<(), anyhow::Error> {
         .top_n_ids("My boss says I zindle too much, what does that mean?", 1)
         .await?;
 
-    println!("Results: {:?}", results);
+    println!("Results: {results:?}");
 
     Ok(())
 }

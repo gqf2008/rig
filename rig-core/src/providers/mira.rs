@@ -7,21 +7,20 @@
 //! let client = mira::Client::new("YOUR_API_KEY");
 //!
 //! ```
+use crate::client::{CompletionClient, ProviderClient};
 use crate::json_utils::merge;
 use crate::providers::openai;
 use crate::providers::openai::send_compatible_streaming_request;
-use crate::streaming::{StreamingCompletionModel, StreamingCompletionResponse};
+use crate::streaming::StreamingCompletionResponse;
 use crate::{
-    agent::AgentBuilder,
-    completion::{self, CompletionError, CompletionRequest},
-    extractor::ExtractorBuilder,
-    message::{self, AssistantContent, Message, UserContent},
     OneOrMany,
+    completion::{self, CompletionError, CompletionRequest},
+    impl_conversion_traits,
+    message::{self, AssistantContent, Message, UserContent},
 };
-use reqwest::header::{HeaderMap, HeaderValue, AUTHORIZATION, CONTENT_TYPE};
-use schemars::JsonSchema;
-use serde::{Deserialize, Serialize};
-use serde_json::{json, Value};
+use reqwest::header::{CONTENT_TYPE, HeaderMap, HeaderValue};
+use serde::Deserialize;
+use serde_json::{Value, json};
 use std::string::FromUtf8Error;
 use thiserror::Error;
 use tracing;
@@ -62,6 +61,7 @@ impl TryFrom<RawMessage> for message::Message {
                 content: OneOrMany::one(UserContent::Text(message::Text { text: raw.content })),
             }),
             "assistant" => Ok(message::Message::Assistant {
+                id: None,
                 content: OneOrMany::one(AssistantContent::Text(message::Text {
                     text: raw.content,
                 })),
@@ -112,8 +112,20 @@ struct ModelInfo {
 /// Client for interacting with the Mira API
 pub struct Client {
     base_url: String,
-    client: reqwest::Client,
+    http_client: reqwest::Client,
+    api_key: String,
     headers: HeaderMap,
+}
+
+impl std::fmt::Debug for Client {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Client")
+            .field("base_url", &self.base_url)
+            .field("http_client", &self.http_client)
+            .field("api_key", &"<REDACTED>")
+            .field("headers", &self.headers)
+            .finish()
+    }
 }
 
 impl Client {
@@ -121,11 +133,6 @@ impl Client {
     pub fn new(api_key: &str) -> Result<Self, MiraError> {
         let mut headers = HeaderMap::new();
         headers.insert(CONTENT_TYPE, HeaderValue::from_static("application/json"));
-        headers.insert(
-            AUTHORIZATION,
-            HeaderValue::from_str(&format!("Bearer {}", api_key))
-                .map_err(|_| MiraError::InvalidApiKey)?,
-        );
         headers.insert(
             reqwest::header::ACCEPT,
             HeaderValue::from_static("application/json"),
@@ -137,18 +144,12 @@ impl Client {
 
         Ok(Self {
             base_url: MIRA_API_BASE_URL.to_string(),
-            client: reqwest::Client::builder()
+            api_key: api_key.to_string(),
+            http_client: reqwest::Client::builder()
                 .build()
                 .expect("Failed to build HTTP client"),
             headers,
         })
-    }
-
-    /// Create a new Mira client from the `MIRA_API_KEY` environment variable.
-    /// Panics if the environment variable is not set.
-    pub fn from_env() -> Result<Self, MiraError> {
-        let api_key = std::env::var("MIRA_API_KEY").expect("MIRA_API_KEY not set");
-        Self::new(&api_key)
     }
 
     /// Create a new Mira client with a custom base URL and API key
@@ -161,13 +162,22 @@ impl Client {
         Ok(client)
     }
 
+    /// Use your own `reqwest::Client`.
+    /// The required headers will be automatically attached upon trying to make a request.
+    pub fn with_custom_client(mut self, client: reqwest::Client) -> Self {
+        self.http_client = client;
+
+        self
+    }
+
     /// List available models
     pub async fn list_models(&self) -> Result<Vec<String>, MiraError> {
         let url = format!("{}/v1/models", self.base_url);
 
         let response = self
-            .client
+            .http_client
             .get(&url)
+            .bearer_auth(&self.api_key)
             .headers(self.headers.clone())
             .send()
             .await?;
@@ -190,25 +200,38 @@ impl Client {
 
         Ok(models.data.into_iter().map(|model| model.id).collect())
     }
+}
 
-    /// Create a completion model with the given name.
-    pub fn completion_model(&self, model: &str) -> CompletionModel {
-        CompletionModel::new(self.to_owned(), model)
+impl ProviderClient for Client {
+    /// Create a new Mira client from the `MIRA_API_KEY` environment variable.
+    /// Panics if the environment variable is not set.
+    fn from_env() -> Self {
+        let api_key = std::env::var("MIRA_API_KEY").expect("MIRA_API_KEY not set");
+        Self::new(&api_key).expect("Could not create Mira Client")
     }
 
-    /// Create an agent builder with the given completion model.
-    pub fn agent(&self, model: &str) -> AgentBuilder<CompletionModel> {
-        AgentBuilder::new(self.completion_model(model))
-    }
-
-    /// Create an extractor builder with the given completion model.
-    pub fn extractor<T: JsonSchema + for<'a> Deserialize<'a> + Serialize + Send + Sync>(
-        &self,
-        model: &str,
-    ) -> ExtractorBuilder<T, CompletionModel> {
-        ExtractorBuilder::new(self.completion_model(model))
+    fn from_val(input: crate::client::ProviderValue) -> Self {
+        let crate::client::ProviderValue::Simple(api_key) = input else {
+            panic!("Incorrect provider value type")
+        };
+        Self::new(&api_key).unwrap()
     }
 }
+
+impl CompletionClient for Client {
+    type CompletionModel = CompletionModel;
+    /// Create a completion model with the given name.
+    fn completion_model(&self, model: &str) -> CompletionModel {
+        CompletionModel::new(self.to_owned(), model)
+    }
+}
+
+impl_conversion_traits!(
+    AsEmbeddings,
+    AsTranscription,
+    AsImageGeneration,
+    AsAudioGeneration for Client
+);
 
 #[derive(Clone)]
 pub struct CompletionModel {
@@ -273,7 +296,7 @@ impl CompletionModel {
                         .join("\n");
                     ("user", text)
                 }
-                Message::Assistant { content } => {
+                Message::Assistant { content, .. } => {
                     let text = content
                         .iter()
                         .map(|c| match c {
@@ -305,6 +328,7 @@ impl CompletionModel {
 
 impl completion::CompletionModel for CompletionModel {
     type Response = CompletionResponse;
+    type StreamingResponse = openai::StreamingCompletionResponse;
 
     #[cfg_attr(feature = "worker", worker::send)]
     async fn completion(
@@ -322,8 +346,9 @@ impl completion::CompletionModel for CompletionModel {
 
         let response = self
             .client
-            .client
+            .http_client
             .post(format!("{}/v1/chat/completions", self.client.base_url))
+            .bearer_auth(&self.client.api_key)
             .headers(self.client.headers.clone())
             .json(&mira_request)
             .send()
@@ -334,8 +359,7 @@ impl completion::CompletionModel for CompletionModel {
             let status = response.status().as_u16();
             let error_text = response.text().await.unwrap_or_default();
             return Err(CompletionError::ProviderError(format!(
-                "API error: {} - {}",
-                status, error_text
+                "API error: {status} - {error_text}"
             )));
         }
 
@@ -346,10 +370,8 @@ impl completion::CompletionModel for CompletionModel {
 
         response.try_into()
     }
-}
 
-impl StreamingCompletionModel for CompletionModel {
-    type StreamingResponse = openai::StreamingCompletionResponse;
+    #[cfg_attr(feature = "worker", worker::send)]
     async fn stream(
         &self,
         completion_request: CompletionRequest,
@@ -360,7 +382,7 @@ impl StreamingCompletionModel for CompletionModel {
 
         let builder = self
             .client
-            .client
+            .http_client
             .post(format!("{}/v1/chat/completions", self.client.base_url))
             .headers(self.client.headers.clone())
             .json(&request);
@@ -379,17 +401,26 @@ impl TryFrom<CompletionResponse> for completion::CompletionResponse<CompletionRe
     type Error = CompletionError;
 
     fn try_from(response: CompletionResponse) -> Result<Self, Self::Error> {
-        let content = match &response {
-            CompletionResponse::Structured { choices, .. } => {
+        let (content, usage) = match &response {
+            CompletionResponse::Structured { choices, usage, .. } => {
                 let choice = choices.first().ok_or_else(|| {
                     CompletionError::ResponseError("Response contained no choices".to_owned())
                 })?;
 
+                let usage = usage
+                    .as_ref()
+                    .map(|usage| completion::Usage {
+                        input_tokens: usage.prompt_tokens as u64,
+                        output_tokens: (usage.total_tokens - usage.prompt_tokens) as u64,
+                        total_tokens: usage.total_tokens as u64,
+                    })
+                    .unwrap_or_default();
+
                 // Convert RawMessage to message::Message
                 let message = message::Message::try_from(choice.message.clone())?;
 
-                match message {
-                    Message::Assistant { content } => {
+                let content = match message {
+                    Message::Assistant { content, .. } => {
                         if content.is_empty() {
                             return Err(CompletionError::ResponseError(
                                 "Response contained empty content".to_owned(),
@@ -409,7 +440,7 @@ impl TryFrom<CompletionResponse> for completion::CompletionResponse<CompletionRe
                             match c {
                                 AssistantContent::Text(text) => Ok(completion::AssistantContent::text(&text.text)),
                                 other => Err(CompletionError::ResponseError(
-                                    format!("Unsupported content type: {:?}. The Mira provider currently only supports text content", other)
+                                    format!("Unsupported content type: {other:?}. The Mira provider currently only supports text content")
                                 ))
                             }
                         }).collect::<Result<Vec<_>, _>>()?
@@ -420,11 +451,14 @@ impl TryFrom<CompletionResponse> for completion::CompletionResponse<CompletionRe
                             "Received user message in response where assistant message was expected".to_owned()
                         ));
                     }
-                }
+                };
+
+                (content, usage)
             }
-            CompletionResponse::Simple(text) => {
-                vec![completion::AssistantContent::text(text)]
-            }
+            CompletionResponse::Simple(text) => (
+                vec![completion::AssistantContent::text(text)],
+                completion::Usage::new(),
+            ),
         };
 
         let choice = OneOrMany::many(content).map_err(|_| {
@@ -435,6 +469,7 @@ impl TryFrom<CompletionResponse> for completion::CompletionResponse<CompletionRe
 
         Ok(completion::CompletionResponse {
             choice,
+            usage,
             raw_response: response,
         })
     }
@@ -473,7 +508,7 @@ impl From<Message> for serde_json::Value {
                     "content": text
                 })
             }
-            Message::Assistant { content } => {
+            Message::Assistant { content, .. } => {
                 let text = content
                     .iter()
                     .map(|c| match c {
@@ -515,13 +550,13 @@ impl TryFrom<serde_json::Value> for Message {
                 _ => {
                     return Err(CompletionError::ResponseError(
                         "Message content must be string or array".to_owned(),
-                    ))
+                    ));
                 }
             },
             None => {
                 return Err(CompletionError::ResponseError(
                     "Message missing content field".to_owned(),
-                ))
+                ));
             }
         };
 
@@ -530,11 +565,11 @@ impl TryFrom<serde_json::Value> for Message {
                 content: OneOrMany::one(UserContent::Text(message::Text { text: content })),
             }),
             "assistant" => Ok(Message::Assistant {
+                id: None,
                 content: OneOrMany::one(AssistantContent::Text(message::Text { text: content })),
             }),
             _ => Err(CompletionError::ResponseError(format!(
-                "Unsupported message role: {}",
-                role
+                "Unsupported message role: {role}"
             ))),
         }
     }
@@ -574,7 +609,7 @@ mod tests {
 
         // Test string content format
         match assistant_message {
-            Message::Assistant { content } => {
+            Message::Assistant { content, .. } => {
                 assert_eq!(
                     content.first(),
                     AssistantContent::Text(message::Text {
@@ -599,7 +634,7 @@ mod tests {
 
         // Test array content format
         match assistant_message_array {
-            Message::Assistant { content } => {
+            Message::Assistant { content, .. } => {
                 assert_eq!(
                     content.first(),
                     AssistantContent::Text(message::Text {
@@ -619,15 +654,12 @@ mod tests {
         };
 
         // Convert to Mira format
-        let mira_value: serde_json::Value = original_message.clone().try_into().unwrap();
+        let mira_value: serde_json::Value = original_message.clone().into();
 
         // Convert back to our Message type
         let converted_message: Message = mira_value.try_into().unwrap();
 
-        // Convert back to original format
-        let final_message: message::Message = converted_message.try_into().unwrap();
-
-        assert_eq!(original_message, final_message);
+        assert_eq!(original_message, converted_message);
     }
 
     #[test]

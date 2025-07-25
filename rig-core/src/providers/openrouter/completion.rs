@@ -3,14 +3,16 @@ use serde::Deserialize;
 use super::client::{ApiErrorResponse, ApiResponse, Client, Usage};
 
 use crate::{
+    OneOrMany,
     completion::{self, CompletionError, CompletionRequest},
     json_utils,
     providers::openai::Message,
-    OneOrMany,
 };
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 
 use crate::providers::openai::AssistantContent;
+use crate::providers::openrouter::streaming::FinalCompletionResponse;
+use crate::streaming::StreamingCompletionResponse;
 
 // ================================================================
 // OpenRouter Completion API
@@ -93,8 +95,19 @@ impl TryFrom<CompletionResponse> for completion::CompletionResponse<CompletionRe
             )
         })?;
 
+        let usage = response
+            .usage
+            .as_ref()
+            .map(|usage| completion::Usage {
+                input_tokens: usage.prompt_tokens as u64,
+                output_tokens: (usage.total_tokens - usage.prompt_tokens) as u64,
+                total_tokens: usage.total_tokens as u64,
+            })
+            .unwrap_or_default();
+
         Ok(completion::CompletionResponse {
             choice,
+            usage,
             raw_response: response,
         })
     }
@@ -156,7 +169,7 @@ impl CompletionModel {
             "model": self.model,
             "messages": full_history,
             "temperature": completion_request.temperature,
-            "tool_calls": completion_request.tools
+            "tools": completion_request.tools.into_iter().map(crate::providers::openai::completion::ToolDefinition::from).collect::<Vec<_>>()
         });
 
         let request = if let Some(params) = completion_request.additional_params {
@@ -171,6 +184,7 @@ impl CompletionModel {
 
 impl completion::CompletionModel for CompletionModel {
     type Response = CompletionResponse;
+    type StreamingResponse = FinalCompletionResponse;
 
     #[cfg_attr(feature = "worker", worker::send)]
     async fn completion(
@@ -193,7 +207,8 @@ impl completion::CompletionModel for CompletionModel {
                         "OpenRouter completion token usage: {:?}",
                         response.usage.clone().map(|usage| format!("{usage}")).unwrap_or("N/A".to_string())
                     );
-
+                    tracing::debug!(target: "rig",
+                        "OpenRouter response: {response:?}");
                     response.try_into()
                 }
                 ApiResponse::Err(err) => Err(CompletionError::ProviderError(err.message)),
@@ -201,5 +216,13 @@ impl completion::CompletionModel for CompletionModel {
         } else {
             Err(CompletionError::ProviderError(response.text().await?))
         }
+    }
+
+    #[cfg_attr(feature = "worker", worker::send)]
+    async fn stream(
+        &self,
+        completion_request: CompletionRequest,
+    ) -> Result<StreamingCompletionResponse<Self::StreamingResponse>, CompletionError> {
+        CompletionModel::stream(self, completion_request).await
     }
 }

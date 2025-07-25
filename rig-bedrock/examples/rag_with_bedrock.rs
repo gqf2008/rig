@@ -1,8 +1,9 @@
 use std::vec;
 
+use rig::client::{CompletionClient, EmbeddingsClient};
 use rig::{
-    completion::Prompt, embeddings::EmbeddingsBuilder,
-    vector_store::in_memory_store::InMemoryVectorStore, Embed,
+    Embed, completion::Prompt, embeddings::EmbeddingsBuilder,
+    vector_store::in_memory_store::InMemoryVectorStore,
 };
 use rig_bedrock::{
     client::ClientBuilder, completion::AMAZON_NOVA_LITE, embedding::AMAZON_TITAN_EMBED_TEXT_V2_0,
@@ -29,7 +30,7 @@ async fn main() -> Result<(), anyhow::Error> {
         .init();
 
     let client = ClientBuilder::new().build().await;
-    let embedding_model = client.embedding_model(AMAZON_TITAN_EMBED_TEXT_V2_0, 256);
+    let embedding_model = client.embedding_model_with_ndims(AMAZON_TITAN_EMBED_TEXT_V2_0, 256);
 
     // Generate embeddings for the definitions of all the documents using the specified embedding model.
     let embeddings = EmbeddingsBuilder::new(embedding_model.clone())

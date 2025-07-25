@@ -1,19 +1,19 @@
 //! Anthropic completion api implementation
 
-use std::{convert::Infallible, str::FromStr};
-
 use crate::{
+    OneOrMany,
     completion::{self, CompletionError},
     json_utils,
-    message::{self, MessageError},
+    message::{self, DocumentMediaType, MessageError, Reasoning},
     one_or_many::string_or_one_or_many,
-    OneOrMany,
 };
-
-use serde::{Deserialize, Serialize};
-use serde_json::json;
+use std::{convert::Infallible, str::FromStr};
 
 use super::client::Client;
+use crate::completion::CompletionRequest;
+use crate::providers::anthropic::streaming::StreamingCompletionResponse;
+use serde::{Deserialize, Serialize};
+use serde_json::json;
 
 // ================================================================
 // Anthropic Completion API
@@ -107,7 +107,7 @@ impl TryFrom<CompletionResponse> for completion::CompletionResponse<CompletionRe
                     _ => {
                         return Err(CompletionError::ResponseError(
                             "Response did not contain a message or tool call".into(),
-                        ))
+                        ));
                     }
                 })
             })
@@ -119,8 +119,15 @@ impl TryFrom<CompletionResponse> for completion::CompletionResponse<CompletionRe
             )
         })?;
 
+        let usage = completion::Usage {
+            input_tokens: response.usage.input_tokens,
+            output_tokens: response.usage.output_tokens,
+            total_tokens: response.usage.input_tokens + response.usage.output_tokens,
+        };
+
         Ok(completion::CompletionResponse {
             choice,
+            usage,
             raw_response: response,
         })
     }
@@ -163,6 +170,10 @@ pub enum Content {
     },
     Document {
         source: DocumentSource,
+    },
+    Thinking {
+        thinking: String,
+        signature: Option<String>,
     },
 }
 
@@ -216,6 +227,9 @@ pub enum ImageFormat {
     WEBP,
 }
 
+/// The document format to be used.
+///
+/// Currently, Anthropic only supports PDF for text documents over the API (within a message). You can find more information about this here: <https://docs.anthropic.com/en/docs/build-with-claude/pdf-support>
 #[derive(Debug, Deserialize, Serialize, Clone, PartialEq)]
 #[serde(rename_all = "lowercase")]
 pub enum DocumentFormat {
@@ -273,8 +287,8 @@ impl TryFrom<message::ImageMediaType> for ImageFormat {
             message::ImageMediaType::WEBP => ImageFormat::WEBP,
             _ => {
                 return Err(MessageError::ConversionError(
-                    format!("Unsupported image media type: {:?}", media_type).to_owned(),
-                ))
+                    format!("Unsupported image media type: {media_type:?}").to_owned(),
+                ));
             }
         })
     }
@@ -291,17 +305,34 @@ impl From<ImageFormat> for message::ImageMediaType {
     }
 }
 
+impl TryFrom<DocumentMediaType> for DocumentFormat {
+    type Error = MessageError;
+    fn try_from(value: DocumentMediaType) -> Result<Self, Self::Error> {
+        if !matches!(value, DocumentMediaType::PDF) {
+            return Err(MessageError::ConversionError(
+                "Anthropic only supports PDF documents".to_string(),
+            ));
+        };
+
+        Ok(DocumentFormat::PDF)
+    }
+}
+
 impl From<message::AssistantContent> for Content {
     fn from(text: message::AssistantContent) -> Self {
         match text {
             message::AssistantContent::Text(message::Text { text }) => Content::Text { text },
-            message::AssistantContent::ToolCall(message::ToolCall { id, function }) => {
+            message::AssistantContent::ToolCall(message::ToolCall { id, function, .. }) => {
                 Content::ToolUse {
                     id,
                     name: function.name,
                     input: function.arguments,
                 }
             }
+            message::AssistantContent::Reasoning(Reasoning { reasoning }) => Content::Thinking {
+                thinking: reasoning,
+                signature: None,
+            },
         }
     }
 }
@@ -317,32 +348,31 @@ impl TryFrom<message::Message> for Message {
                     message::UserContent::Text(message::Text { text }) => {
                         Ok(Content::Text { text })
                     }
-                    message::UserContent::ToolResult(message::ToolResult { id, content }) => {
-                        Ok(Content::ToolResult {
-                            tool_use_id: id,
-                            content: content.try_map(|content| match content {
-                                message::ToolResultContent::Text(message::Text { text }) => {
-                                    Ok(ToolResultContent::Text { text })
-                                }
-                                message::ToolResultContent::Image(image) => {
-                                    let media_type =
-                                        image.media_type.ok_or(MessageError::ConversionError(
-                                            "Image media type is required".to_owned(),
-                                        ))?;
-                                    let format =
-                                        image.format.ok_or(MessageError::ConversionError(
-                                            "Image format is required".to_owned(),
-                                        ))?;
-                                    Ok(ToolResultContent::Image(ImageSource {
-                                        data: image.data,
-                                        media_type: media_type.try_into()?,
-                                        r#type: format.try_into()?,
-                                    }))
-                                }
-                            })?,
-                            is_error: None,
-                        })
-                    }
+                    message::UserContent::ToolResult(message::ToolResult {
+                        id, content, ..
+                    }) => Ok(Content::ToolResult {
+                        tool_use_id: id,
+                        content: content.try_map(|content| match content {
+                            message::ToolResultContent::Text(message::Text { text }) => {
+                                Ok(ToolResultContent::Text { text })
+                            }
+                            message::ToolResultContent::Image(image) => {
+                                let media_type =
+                                    image.media_type.ok_or(MessageError::ConversionError(
+                                        "Image media type is required".to_owned(),
+                                    ))?;
+                                let format = image.format.ok_or(MessageError::ConversionError(
+                                    "Image format is required".to_owned(),
+                                ))?;
+                                Ok(ToolResultContent::Image(ImageSource {
+                                    data: image.data,
+                                    media_type: media_type.try_into()?,
+                                    r#type: format.try_into()?,
+                                }))
+                            }
+                        })?,
+                        is_error: None,
+                    }),
                     message::UserContent::Image(message::Image {
                         data,
                         format,
@@ -356,7 +386,7 @@ impl TryFrom<message::Message> for Message {
                                 None => {
                                     return Err(MessageError::ConversionError(
                                         "Image media type is required".to_owned(),
-                                    ))
+                                    ));
                                 }
                             },
                             r#type: match format {
@@ -366,10 +396,20 @@ impl TryFrom<message::Message> for Message {
                         };
                         Ok(Content::Image { source })
                     }
-                    message::UserContent::Document(message::Document { data, format, .. }) => {
+                    message::UserContent::Document(message::Document {
+                        data,
+                        format,
+                        media_type,
+                    }) => {
+                        let Some(media_type) = media_type else {
+                            return Err(MessageError::ConversionError(
+                                "Document media type is required".to_string(),
+                            ));
+                        };
+
                         let source = DocumentSource {
                             data,
-                            media_type: DocumentFormat::PDF,
+                            media_type: media_type.try_into()?,
                             r#type: match format {
                                 Some(format) => format.try_into()?,
                                 None => SourceType::BASE64,
@@ -383,7 +423,7 @@ impl TryFrom<message::Message> for Message {
                 })?,
             },
 
-            message::Message::Assistant { content } => Message {
+            message::Message::Assistant { content, .. } => Message {
                 content: content.map(|content| content.into()),
                 role: Role::Assistant,
             },
@@ -402,9 +442,8 @@ impl TryFrom<Content> for message::AssistantContent {
             }
             _ => {
                 return Err(MessageError::ConversionError(
-                    format!("Unsupported content type for Assistant role: {:?}", content)
-                        .to_owned(),
-                ))
+                    format!("Unsupported content type for Assistant role: {content:?}").to_owned(),
+                ));
             }
         })
     }
@@ -459,20 +498,21 @@ impl TryFrom<Message> for message::Message {
                         _ => {
                             return Err(MessageError::ConversionError(
                                 "Unsupported content type for User role".to_owned(),
-                            ))
+                            ));
                         }
                     })
                 })?,
             },
             Role::Assistant => match message.content.first() {
                 Content::Text { .. } | Content::ToolUse { .. } => message::Message::Assistant {
+                    id: None,
                     content: message.content.try_map(|content| content.try_into())?,
                 },
 
                 _ => {
                     return Err(MessageError::ConversionError(
-                        format!("Unsupported message for Assistant role: {:?}", message).to_owned(),
-                    ))
+                        format!("Unsupported message for Assistant role: {message:?}").to_owned(),
+                    ));
                 }
             },
         })
@@ -532,6 +572,7 @@ pub enum ToolChoice {
 
 impl completion::CompletionModel for CompletionModel {
     type Response = CompletionResponse;
+    type StreamingResponse = StreamingCompletionResponse;
 
     #[cfg_attr(feature = "worker", worker::send)]
     async fn completion(
@@ -620,6 +661,17 @@ impl completion::CompletionModel for CompletionModel {
         } else {
             Err(CompletionError::ProviderError(response.text().await?))
         }
+    }
+
+    #[cfg_attr(feature = "worker", worker::send)]
+    async fn stream(
+        &self,
+        request: CompletionRequest,
+    ) -> Result<
+        crate::streaming::StreamingCompletionResponse<Self::StreamingResponse>,
+        CompletionError,
+    > {
+        CompletionModel::stream(self, request).await
     }
 }
 
@@ -713,93 +765,88 @@ mod tests {
             })
         };
 
-        match assistant_message {
-            Message { role, content } => {
-                assert_eq!(role, Role::Assistant);
-                assert_eq!(
-                    content.first(),
-                    Content::Text {
-                        text: "\n\nHello there, how may I assist you today?".to_owned()
-                    }
-                );
+        let Message { role, content } = assistant_message;
+        assert_eq!(role, Role::Assistant);
+        assert_eq!(
+            content.first(),
+            Content::Text {
+                text: "\n\nHello there, how may I assist you today?".to_owned()
             }
+        );
+
+        let Message { role, content } = assistant_message2;
+        {
+            assert_eq!(role, Role::Assistant);
+            assert_eq!(content.len(), 2);
+
+            let mut iter = content.into_iter();
+
+            match iter.next().unwrap() {
+                Content::Text { text } => {
+                    assert_eq!(text, "\n\nHello there, how may I assist you today?");
+                }
+                _ => panic!("Expected text content"),
+            }
+
+            match iter.next().unwrap() {
+                Content::ToolUse { id, name, input } => {
+                    assert_eq!(id, "toolu_01A09q90qw90lq917835lq9");
+                    assert_eq!(name, "get_weather");
+                    assert_eq!(input, json!({"location": "San Francisco, CA"}));
+                }
+                _ => panic!("Expected tool use content"),
+            }
+
+            assert_eq!(iter.next(), None);
         }
 
-        match assistant_message2 {
-            Message { role, content } => {
-                assert_eq!(role, Role::Assistant);
-                assert_eq!(content.len(), 2);
+        let Message { role, content } = user_message;
+        {
+            assert_eq!(role, Role::User);
+            assert_eq!(content.len(), 3);
 
-                let mut iter = content.into_iter();
+            let mut iter = content.into_iter();
 
-                match iter.next().unwrap() {
-                    Content::Text { text } => {
-                        assert_eq!(text, "\n\nHello there, how may I assist you today?");
-                    }
-                    _ => panic!("Expected text content"),
+            match iter.next().unwrap() {
+                Content::Image { source } => {
+                    assert_eq!(
+                        source,
+                        ImageSource {
+                            data: "/9j/4AAQSkZJRg...".to_owned(),
+                            media_type: ImageFormat::JPEG,
+                            r#type: SourceType::BASE64,
+                        }
+                    );
                 }
-
-                match iter.next().unwrap() {
-                    Content::ToolUse { id, name, input } => {
-                        assert_eq!(id, "toolu_01A09q90qw90lq917835lq9");
-                        assert_eq!(name, "get_weather");
-                        assert_eq!(input, json!({"location": "San Francisco, CA"}));
-                    }
-                    _ => panic!("Expected tool use content"),
-                }
-
-                assert_eq!(iter.next(), None);
+                _ => panic!("Expected image content"),
             }
-        }
 
-        match user_message {
-            Message { role, content } => {
-                assert_eq!(role, Role::User);
-                assert_eq!(content.len(), 3);
-
-                let mut iter = content.into_iter();
-
-                match iter.next().unwrap() {
-                    Content::Image { source } => {
-                        assert_eq!(
-                            source,
-                            ImageSource {
-                                data: "/9j/4AAQSkZJRg...".to_owned(),
-                                media_type: ImageFormat::JPEG,
-                                r#type: SourceType::BASE64,
-                            }
-                        );
-                    }
-                    _ => panic!("Expected image content"),
+            match iter.next().unwrap() {
+                Content::Text { text } => {
+                    assert_eq!(text, "What is in this image?");
                 }
-
-                match iter.next().unwrap() {
-                    Content::Text { text } => {
-                        assert_eq!(text, "What is in this image?");
-                    }
-                    _ => panic!("Expected text content"),
-                }
-
-                match iter.next().unwrap() {
-                    Content::ToolResult {
-                        tool_use_id,
-                        content,
-                        is_error,
-                    } => {
-                        assert_eq!(tool_use_id, "toolu_01A09q90qw90lq917835lq9");
-                        assert_eq!(
-                            content.first(),
-                            ToolResultContent::Text {
-                                text: "15 degrees".to_owned()
-                            }
-                        );
-                        assert_eq!(is_error, None);
-                    }
-                    _ => panic!("Expected tool result content"),
-                }
-
-                assert_eq!(iter.next(), None);
+                _ => panic!("Expected text content"),
             }
+
+            match iter.next().unwrap() {
+                Content::ToolResult {
+                    tool_use_id,
+                    content,
+                    is_error,
+                } => {
+                    assert_eq!(tool_use_id, "toolu_01A09q90qw90lq917835lq9");
+                    assert_eq!(
+                        content.first(),
+                        ToolResultContent::Text {
+                            text: "15 degrees".to_owned()
+                        }
+                    );
+                    assert_eq!(is_error, None);
+                }
+                _ => panic!("Expected tool result content"),
+            }
+
+            assert_eq!(iter.next(), None);
         }
     }
 
@@ -924,11 +971,13 @@ mod tests {
         }
 
         match converted_assistant_message.clone() {
-            message::Message::Assistant { content } => {
+            message::Message::Assistant { content, .. } => {
                 assert_eq!(content.len(), 1);
 
                 match content.first() {
-                    message::AssistantContent::ToolCall(message::ToolCall { id, function }) => {
+                    message::AssistantContent::ToolCall(message::ToolCall {
+                        id, function, ..
+                    }) => {
                         assert_eq!(id, "toolu_01A09q90qw90lq917835lq9");
                         assert_eq!(function.name, "get_weather");
                         assert_eq!(function.arguments, json!({"location": "San Francisco, CA"}));

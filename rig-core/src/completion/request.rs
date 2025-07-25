@@ -62,20 +62,22 @@
 //!
 //! For more information on how to use the completion functionality, refer to the documentation of
 //! the individual traits, structs, and enums defined in this module.
-use std::collections::HashMap;
 
-use serde::{Deserialize, Serialize};
-use thiserror::Error;
-
-use crate::streaming::{StreamingCompletionModel, StreamingCompletionResponse};
-use crate::OneOrMany;
+use super::message::{AssistantContent, ContentFormat, DocumentMediaType};
+use crate::client::completion::CompletionModelHandle;
+use crate::streaming::StreamingCompletionResponse;
+use crate::{OneOrMany, streaming};
 use crate::{
     json_utils,
     message::{Message, UserContent},
     tool::ToolSetError,
 };
-
-use super::message::{AssistantContent, ContentFormat, DocumentMediaType};
+use futures::future::BoxFuture;
+use serde::{Deserialize, Serialize};
+use std::collections::HashMap;
+use std::ops::{Add, AddAssign};
+use std::sync::Arc;
+use thiserror::Error;
 
 // Errors
 #[derive(Debug, Error)]
@@ -101,14 +103,20 @@ pub enum CompletionError {
     ProviderError(String),
 }
 
+/// Prompt errors
 #[derive(Debug, Error)]
 pub enum PromptError {
+    /// Something went wrong with the completion
     #[error("CompletionError: {0}")]
     CompletionError(#[from] CompletionError),
 
+    /// There was an error while using a tool
     #[error("ToolCallError: {0}")]
     ToolError(#[from] ToolSetError),
 
+    /// The LLM tried to call too many tools during a multi-turn conversation.
+    /// To fix this, you may either need to lower the amount of tools your model has access to (and then create other agents to share the tool load)
+    /// or increase the amount of turns given in `.multi_turn()`.
     #[error("MaxDepthError: (reached limit: {max_depth})")]
     MaxDepthError {
         max_depth: usize,
@@ -138,7 +146,7 @@ impl std::fmt::Display for Document {
                 sorted_props.sort_by(|a, b| a.0.cmp(b.0));
                 let metadata = sorted_props
                     .iter()
-                    .map(|(k, v)| format!("{}: {:?}", k, v))
+                    .map(|(k, v)| format!("{k}: {v:?}"))
                     .collect::<Vec<_>>()
                     .join(" ");
                 format!("<metadata {} />\n{}", metadata, self.text)
@@ -217,8 +225,56 @@ pub struct CompletionResponse<T> {
     /// The completion choice (represented by one or more assistant message content)
     /// returned by the completion model provider
     pub choice: OneOrMany<AssistantContent>,
+    /// Tokens used during prompting and responding
+    pub usage: Usage,
     /// The raw response returned by the completion model provider
     pub raw_response: T,
+}
+
+/// Struct representing the token usage for a completion request.
+/// If tokens used are `0`, then the provider failed to supply token usage metrics.
+#[derive(Debug, PartialEq, Eq, Clone, Copy)]
+pub struct Usage {
+    pub input_tokens: u64,
+    pub output_tokens: u64,
+    // We store this separately as some providers may only report one number
+    pub total_tokens: u64,
+}
+
+impl Usage {
+    pub fn new() -> Self {
+        Self {
+            input_tokens: 0,
+            output_tokens: 0,
+            total_tokens: 0,
+        }
+    }
+}
+
+impl Default for Usage {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl Add for Usage {
+    type Output = Self;
+
+    fn add(self, other: Self) -> Self::Output {
+        Self {
+            input_tokens: self.input_tokens + other.input_tokens,
+            output_tokens: self.output_tokens + other.output_tokens,
+            total_tokens: self.total_tokens + other.total_tokens,
+        }
+    }
+}
+
+impl AddAssign for Usage {
+    fn add_assign(&mut self, other: Self) {
+        self.input_tokens += other.input_tokens;
+        self.output_tokens += other.output_tokens;
+        self.total_tokens += other.total_tokens;
+    }
 }
 
 /// Trait defining a completion model that can be used to generate completion responses.
@@ -227,26 +283,103 @@ pub struct CompletionResponse<T> {
 pub trait CompletionModel: Clone + Send + Sync {
     /// The raw response type returned by the underlying completion model.
     type Response: Send + Sync;
+    /// The raw response type returned by the underlying completion model when streaming.
+    type StreamingResponse: Clone + Unpin + Send + Sync;
 
     /// Generates a completion response for the given completion request.
     fn completion(
         &self,
         request: CompletionRequest,
-    ) -> impl std::future::Future<Output = Result<CompletionResponse<Self::Response>, CompletionError>>
-           + Send;
+    ) -> impl std::future::Future<
+        Output = Result<CompletionResponse<Self::Response>, CompletionError>,
+    > + Send;
+
+    fn stream(
+        &self,
+        request: CompletionRequest,
+    ) -> impl std::future::Future<
+        Output = Result<StreamingCompletionResponse<Self::StreamingResponse>, CompletionError>,
+    > + Send;
 
     /// Generates a completion request builder for the given `prompt`.
     fn completion_request(&self, prompt: impl Into<Message>) -> CompletionRequestBuilder<Self> {
         CompletionRequestBuilder::new(self.clone(), prompt)
     }
 }
+pub trait CompletionModelDyn: Send + Sync {
+    fn completion(
+        &self,
+        request: CompletionRequest,
+    ) -> BoxFuture<'_, Result<CompletionResponse<()>, CompletionError>>;
+
+    fn stream(
+        &self,
+        request: CompletionRequest,
+    ) -> BoxFuture<Result<StreamingCompletionResponse<()>, CompletionError>>;
+
+    fn completion_request(
+        &self,
+        prompt: Message,
+    ) -> CompletionRequestBuilder<CompletionModelHandle<'_>>;
+}
+
+impl<T, R> CompletionModelDyn for T
+where
+    T: CompletionModel<StreamingResponse = R>,
+    R: Clone + Unpin + 'static,
+{
+    fn completion(
+        &self,
+        request: CompletionRequest,
+    ) -> BoxFuture<Result<CompletionResponse<()>, CompletionError>> {
+        Box::pin(async move {
+            self.completion(request)
+                .await
+                .map(|resp| CompletionResponse {
+                    choice: resp.choice,
+                    usage: resp.usage,
+                    raw_response: (),
+                })
+        })
+    }
+
+    fn stream(
+        &self,
+        request: CompletionRequest,
+    ) -> BoxFuture<Result<StreamingCompletionResponse<()>, CompletionError>> {
+        Box::pin(async move {
+            let resp = self.stream(request).await?;
+            let inner = resp.inner;
+
+            let stream = Box::pin(streaming::StreamingResultDyn {
+                inner: Box::pin(inner),
+            });
+
+            Ok(StreamingCompletionResponse::stream(stream))
+        })
+    }
+
+    /// Generates a completion request builder for the given `prompt`.
+    fn completion_request(
+        &self,
+        prompt: Message,
+    ) -> CompletionRequestBuilder<CompletionModelHandle<'_>> {
+        CompletionRequestBuilder::new(
+            CompletionModelHandle {
+                inner: Arc::new(self.clone()),
+            },
+            prompt,
+        )
+    }
+}
 
 /// Struct representing a general completion request that can be sent to a completion model provider.
+#[derive(Debug, Clone)]
 pub struct CompletionRequest {
     /// The preamble to be sent to the completion model provider
     pub preamble: Option<String>,
-    /// The chat history to be sent to the completion model provider
-    /// The very last message will always be the prompt (hense why there is *always* one)
+    /// The chat history to be sent to the completion model provider.
+    /// The very last message will always be the prompt (hence why there is *always* one)
     pub chat_history: OneOrMany<Message>,
     /// The documents to be sent to the completion model provider
     pub documents: Vec<Document>,
@@ -481,13 +614,15 @@ impl<M: CompletionModel> CompletionRequestBuilder<M> {
         let model = self.model.clone();
         model.completion(self.build()).await
     }
-}
 
-impl<M: StreamingCompletionModel> CompletionRequestBuilder<M> {
     /// Stream the completion request
-    pub async fn stream(
+    pub async fn stream<'a>(
         self,
-    ) -> Result<StreamingCompletionResponse<M::StreamingResponse>, CompletionError> {
+    ) -> Result<StreamingCompletionResponse<M::StreamingResponse>, CompletionError>
+    where
+        <M as CompletionModel>::StreamingResponse: 'a,
+        Self: 'a,
+    {
         let model = self.model.clone();
         model.stream(self.build()).await
     }
@@ -507,7 +642,7 @@ mod tests {
         };
 
         let expected = "<file id: 123>\nThis is a test document.\n</file>\n";
-        assert_eq!(format!("{}", doc), expected);
+        assert_eq!(format!("{doc}"), expected);
     }
 
     #[test]
@@ -528,7 +663,7 @@ mod tests {
             "This is a test document.\n",
             "</file>\n"
         );
-        assert_eq!(format!("{}", doc), expected);
+        assert_eq!(format!("{doc}"), expected);
     }
 
     #[test]

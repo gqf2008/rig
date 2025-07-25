@@ -1,3 +1,4 @@
+use rig::prelude::*;
 use std::env;
 
 use rig::{completion::Prompt, providers};
@@ -17,7 +18,8 @@ async fn main() -> Result<(), anyhow::Error> {
 
     // Prompt the agent and print the response
     let response = comedian_agent.prompt("Entertain me!").await?;
-    println!("{}", response);
+
+    println!("{response}");
 
     Ok(())
 }

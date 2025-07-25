@@ -1,10 +1,9 @@
-use super::completion::CompletionModel;
 use crate::completion::{CompletionError, CompletionRequest};
 use crate::json_utils;
 use crate::json_utils::merge;
-use crate::providers::openai::Usage;
+use crate::providers::openai::completion::{CompletionModel, Usage};
 use crate::streaming;
-use crate::streaming::{RawStreamingChoice, StreamingCompletionModel};
+use crate::streaming::RawStreamingChoice;
 use async_stream::stream;
 use futures::StreamExt;
 use reqwest::RequestBuilder;
@@ -19,9 +18,9 @@ use tracing::debug;
 #[derive(Debug, Serialize, Deserialize, Clone)]
 pub struct StreamingFunction {
     #[serde(default)]
-    name: Option<String>,
+    pub name: Option<String>,
     #[serde(default)]
-    arguments: String,
+    pub arguments: String,
 }
 
 #[derive(Debug, Serialize, Deserialize, Clone)]
@@ -55,12 +54,11 @@ pub struct StreamingCompletionResponse {
     pub usage: Usage,
 }
 
-impl StreamingCompletionModel for CompletionModel {
-    type StreamingResponse = StreamingCompletionResponse;
-    async fn stream(
+impl CompletionModel {
+    pub(crate) async fn stream(
         &self,
         completion_request: CompletionRequest,
-    ) -> Result<streaming::StreamingCompletionResponse<Self::StreamingResponse>, CompletionError>
+    ) -> Result<streaming::StreamingCompletionResponse<StreamingCompletionResponse>, CompletionError>
     {
         let mut request = self.create_completion_request(completion_request)?;
         request = merge(
@@ -126,9 +124,11 @@ pub async fn send_compatible_streaming_request(
                 }
                 // Otherwise full data line
                 else {
-                    let Some(data) = line.strip_prefix("data: ") else {
+                    let Some(data) = line.strip_prefix("data:") else {
                         continue;
                     };
+
+                    let data = data.trim_start();
 
                     // Partial data, split somewhere in the middle
                     if !line.ends_with("}") {
@@ -163,16 +163,16 @@ pub async fn send_compatible_streaming_request(
                                 calls.insert(tool_call.index, (id, function.name.clone().unwrap(), "".to_string()));
                             }
                             // Part of tool call
-                            // name: None
+                            // name: None or Empty String
                             // arguments: Some(String)
-                            else if function.name.is_none() && !function.arguments.is_empty() {
+                            else if function.name.clone().is_none_or(|s| s.is_empty()) && !function.arguments.is_empty() {
                                 let Some((id, name, arguments)) = calls.get(&tool_call.index) else {
                                     debug!("Partial tool call received but tool call was never started.");
                                     continue;
                                 };
 
                                 let new_arguments = &tool_call.function.arguments;
-                                let arguments = format!("{}{}", arguments, new_arguments);
+                                let arguments = format!("{arguments}{new_arguments}");
 
                                 calls.insert(tool_call.index, (id.clone(), name.clone(), arguments));
                             }
@@ -186,7 +186,7 @@ pub async fn send_compatible_streaming_request(
                                     continue;
                                 };
 
-                                yield Ok(streaming::RawStreamingChoice::ToolCall {id, name, arguments})
+                                yield Ok(streaming::RawStreamingChoice::ToolCall {id, name, arguments, call_id: None })
                             }
                         }
                     }
@@ -208,7 +208,7 @@ pub async fn send_compatible_streaming_request(
                 continue;
             };
 
-            yield Ok(RawStreamingChoice::ToolCall {id, name, arguments});
+            yield Ok(RawStreamingChoice::ToolCall {id, name, arguments, call_id: None });
         }
 
         yield Ok(RawStreamingChoice::FinalResponse(StreamingCompletionResponse {
@@ -216,5 +216,5 @@ pub async fn send_compatible_streaming_request(
         }))
     });
 
-    Ok(streaming::StreamingCompletionResponse::new(inner))
+    Ok(streaming::StreamingCompletionResponse::stream(inner))
 }

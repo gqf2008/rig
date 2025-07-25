@@ -30,7 +30,7 @@
 
 use std::marker::PhantomData;
 
-use schemars::{schema_for, JsonSchema};
+use schemars::{JsonSchema, schema_for};
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 
@@ -68,6 +68,22 @@ where
     pub async fn extract(&self, text: impl Into<Message> + Send) -> Result<T, ExtractionError> {
         let response = self.agent.completion(text, vec![]).await?.send().await?;
 
+        if !response.choice.iter().any(|x| {
+            let AssistantContent::ToolCall(ToolCall {
+                function: ToolFunction { name, .. },
+                ..
+            }) = x
+            else {
+                return false;
+            };
+
+            name == SUBMIT_TOOL_NAME
+        }) {
+            tracing::warn!(
+                "The submit tool was not called. If this happens more than once, please ensure the model you are using is powerful enough to reliably call tools."
+            );
+        }
+
         let arguments = response
             .choice
             .into_iter()
@@ -103,6 +119,14 @@ where
 
         Ok(serde_json::from_value(raw_data)?)
     }
+
+    pub async fn get_inner(&self) -> &Agent<M> {
+        &self.agent
+    }
+
+    pub async fn into_inner(self) -> Agent<M> {
+        self.agent
+    }
 }
 
 /// Builder for the Extractor
@@ -124,9 +148,10 @@ impl<T: JsonSchema + for<'a> Deserialize<'a> + Serialize + Send + Sync, M: Compl
                     You are an AI assistant whose purpose is to extract structured data from the provided text.\n\
                     You will have access to a `submit` function that defines the structure of the data to extract from the provided text.\n\
                     Use the `submit` function to submit the structured data.\n\
-                    Be sure to fill out every field and ALWAYS CALL THE `submit` function, event with default values!!!.
+                    Be sure to fill out every field and ALWAYS CALL THE `submit` function, even with default values!!!.
                 ")
                 .tool(SubmitTool::<T> {_t: PhantomData}),
+
             _t: PhantomData,
         }
     }
@@ -142,6 +167,17 @@ impl<T: JsonSchema + for<'a> Deserialize<'a> + Serialize + Send + Sync, M: Compl
     /// Add a context document to the extractor
     pub fn context(mut self, doc: &str) -> Self {
         self.agent_builder = self.agent_builder.context(doc);
+        self
+    }
+
+    pub fn additional_params(mut self, params: serde_json::Value) -> Self {
+        self.agent_builder = self.agent_builder.additional_params(params);
+        self
+    }
+
+    /// Set the maximum number of tokens for the completion
+    pub fn max_tokens(mut self, max_tokens: u64) -> Self {
+        self.agent_builder = self.agent_builder.max_tokens(max_tokens);
         self
     }
 
