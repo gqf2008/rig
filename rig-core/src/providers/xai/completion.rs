@@ -24,6 +24,7 @@ pub const GROK_3_FAST: &str = "grok-3-fast";
 pub const GROK_3_MINI: &str = "grok-3-mini";
 pub const GROK_3_MINI_FAST: &str = "grok-3-mini-fast";
 pub const GROK_2_IMAGE_1212: &str = "grok-2-image-1212";
+pub const GROK_4: &str = "grok-4-0709";
 
 // =================================================================
 // Rig Implementation Types
@@ -231,7 +232,7 @@ pub mod xai_api_types {
         pub arguments: String,
     }
 
-    #[derive(Debug, Deserialize)]
+    #[derive(Debug, Deserialize, Serialize)]
     pub struct CompletionResponse {
         pub id: String,
         pub model: String,
@@ -242,14 +243,14 @@ pub mod xai_api_types {
         pub usage: Usage,
     }
 
-    #[derive(Debug, Deserialize)]
+    #[derive(Debug, Deserialize, Serialize)]
     pub struct Choice {
         pub finish_reason: String,
         pub index: i32,
         pub message: Message,
     }
 
-    #[derive(Debug, Deserialize)]
+    #[derive(Debug, Deserialize, Serialize)]
     pub struct Usage {
         pub completion_tokens: i32,
         pub prompt_tokens: i32,

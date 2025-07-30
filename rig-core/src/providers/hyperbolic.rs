@@ -8,10 +8,9 @@
 //!
 //! let llama_3_1_8b = client.completion_model(hyperbolic::LLAMA_3_1_8B);
 //! ```
-
 use super::openai::{AssistantContent, send_compatible_streaming_request};
 
-use crate::client::{CompletionClient, ProviderClient};
+use crate::client::{ClientBuilderError, CompletionClient, ProviderClient};
 use crate::json_utils::merge_inplace;
 use crate::message;
 use crate::streaming::StreamingCompletionResponse;
@@ -24,13 +23,53 @@ use crate::{
     json_utils,
     providers::openai::Message,
 };
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 
 // ================================================================
 // Main Hyperbolic Client
 // ================================================================
 const HYPERBOLIC_API_BASE_URL: &str = "https://api.hyperbolic.xyz/v1";
+
+pub struct ClientBuilder<'a> {
+    api_key: &'a str,
+    base_url: &'a str,
+    http_client: Option<reqwest::Client>,
+}
+
+impl<'a> ClientBuilder<'a> {
+    pub fn new(api_key: &'a str) -> Self {
+        Self {
+            api_key,
+            base_url: HYPERBOLIC_API_BASE_URL,
+            http_client: None,
+        }
+    }
+
+    pub fn base_url(mut self, base_url: &'a str) -> Self {
+        self.base_url = base_url;
+        self
+    }
+
+    pub fn custom_client(mut self, client: reqwest::Client) -> Self {
+        self.http_client = Some(client);
+        self
+    }
+
+    pub fn build(self) -> Result<Client, ClientBuilderError> {
+        let http_client = if let Some(http_client) = self.http_client {
+            http_client
+        } else {
+            reqwest::Client::builder().build()?
+        };
+
+        Ok(Client {
+            base_url: self.base_url.to_string(),
+            api_key: self.api_key.to_string(),
+            http_client,
+        })
+    }
+}
 
 #[derive(Clone)]
 pub struct Client {
@@ -50,31 +89,31 @@ impl std::fmt::Debug for Client {
 }
 
 impl Client {
-    /// Create a new Hyperbolic client with the given API key.
+    /// Create a new Hyperbolic client builder.
+    ///
+    /// # Example
+    /// ```
+    /// use rig::providers::hyperbolic::{ClientBuilder, self};
+    ///
+    /// // Initialize the Hyperbolic client
+    /// let hyperbolic = Client::builder("your-hyperbolic-api-key")
+    ///    .build()
+    /// ```
+    pub fn builder(api_key: &str) -> ClientBuilder<'_> {
+        ClientBuilder::new(api_key)
+    }
+
+    /// Create a new Hyperbolic client. For more control, use the `builder` method.
+    ///
+    /// # Panics
+    /// - If the reqwest client cannot be built (if the TLS backend cannot be initialized).
     pub fn new(api_key: &str) -> Self {
-        Self::from_url(api_key, HYPERBOLIC_API_BASE_URL)
+        Self::builder(api_key)
+            .build()
+            .expect("Hyperbolic client should build")
     }
 
-    /// Create a new OpenAI client with the given API key and base API URL.
-    pub fn from_url(api_key: &str, base_url: &str) -> Self {
-        Self {
-            base_url: base_url.to_string(),
-            api_key: api_key.to_string(),
-            http_client: reqwest::Client::builder()
-                .build()
-                .expect("OpenAI reqwest client should build"),
-        }
-    }
-
-    /// Use your own `reqwest::Client`.
-    /// The required headers will be automatically attached upon trying to make a request.
-    pub fn with_custom_client(mut self, client: reqwest::Client) -> Self {
-        self.http_client = client;
-
-        self
-    }
-
-    fn post(&self, path: &str) -> reqwest::RequestBuilder {
+    pub(crate) fn post(&self, path: &str) -> reqwest::RequestBuilder {
         let url = format!("{}/{}", self.base_url, path).replace("//", "/");
         self.http_client.post(url).bearer_auth(&self.api_key)
     }
@@ -139,7 +178,7 @@ pub struct EmbeddingData {
     pub index: usize,
 }
 
-#[derive(Clone, Debug, Deserialize)]
+#[derive(Clone, Debug, Deserialize, Serialize)]
 pub struct Usage {
     pub prompt_tokens: usize,
     pub total_tokens: usize,
@@ -186,7 +225,7 @@ pub const DEEPSEEK_R1: &str = "deepseek-ai/DeepSeek-R1";
 /// A Hyperbolic completion object.
 ///
 /// For more information, see this link: <https://docs.hyperbolic.xyz/reference/create_chat_completion_v1_chat_completions_post>
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, Serialize)]
 pub struct CompletionResponse {
     pub id: String,
     pub object: String,
@@ -269,7 +308,7 @@ impl TryFrom<CompletionResponse> for completion::CompletionResponse<CompletionRe
     }
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, Serialize)]
 pub struct Choice {
     pub index: usize,
     pub message: Message,
